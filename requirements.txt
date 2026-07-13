@@ -1,0 +1,7 @@
+# 环境要求（本机 anaconda base 已满足，记录版本供复现）
+# Python >= 3.10
+PySide6>=6.9
+Pillow>=10
+numpy>=1.26
+pywinpty>=2.0
+pytest>=8

@@ -1,0 +1,57 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>terminal</title>
+<link rel="stylesheet" href="app://app/xterm/xterm.css">
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; background: #1e1e1e; overflow: hidden; }
+  #term { width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<div id="term"></div>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script src="app://app/xterm/xterm.js"></script>
+<script src="app://app/xterm/addon-fit.js"></script>
+<script>
+  var term = new Terminal({
+    fontFamily: 'Consolas, "Courier New", monospace',
+    fontSize: 13,
+    theme: {
+      background: '#1e1e1e', foreground: '#d4d4d4',
+      cursor: '#aeafad', selectionBackground: '#264f78'
+    },
+    cursorBlink: true,
+    allowProposedApi: true
+  });
+  var fit = new FitAddon.FitAddon();
+  term.loadAddon(fit);
+  term.open(document.getElementById('term'));
+  fit.fit();
+
+  var bridge = null;
+  new QWebChannel(qt.webChannelTransport, function (channel) {
+    bridge = channel.objects.termBridge;
+    // PTY 输出 -> 终端（base64 过桥，避免二进制/编码损坏）
+    bridge.data_out.connect(function (b64) {
+      var raw = atob(b64);
+      var bytes = new Uint8Array(raw.length);
+      for (var i = 0; i < raw.length; i++) bytes[i] = raw.charCodeAt(i);
+      term.write(bytes);
+    });
+    bridge.pty_exited.connect(function () {
+      term.write('\r\n\x1b[90m[进程已退出，点击工具栏“重启终端”]\x1b[0m\r\n');
+    });
+    // 终端键入 -> PTY
+    term.onData(function (data) { bridge.write_in(btoa(unescape(encodeURIComponent(data)))); });
+    term.onResize(function (sz) { bridge.resize(sz.cols, sz.rows); });
+    bridge.ready(term.cols, term.rows);
+  });
+
+  window.addEventListener('resize', function () {
+    fit.fit();
+  });
+</script>
+</body>
+</html>

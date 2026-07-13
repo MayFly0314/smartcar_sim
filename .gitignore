@@ -1,0 +1,27 @@
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.pytest_cache/
+
+# Monaco 静态文件（由 tools/fetch_monaco.py 重建）
+assets/monaco/vs/
+
+# 生成的赛道序列（由 tools/gen_track.py 确定性重建）
+examples/tracks/
+
+# 临时/输出
+*.tmp
+/build_tmp/
+/run_out/
+
+# 打包产物与构建环境
+/build/
+/dist/
+/build_main/
+/dist_main/
+/.venv-build/
+
+# IDE
+.vscode/
+.idea/

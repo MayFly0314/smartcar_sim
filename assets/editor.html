@@ -1,0 +1,92 @@
+<!DOCTYPE html>
+<html>
+<head>
+<meta charset="utf-8">
+<title>editor</title>
+<style>
+  html, body { margin: 0; padding: 0; height: 100%; overflow: hidden; background: #1e1e1e; }
+  #container { width: 100%; height: 100%; }
+</style>
+</head>
+<body>
+<div id="container"></div>
+<script src="qrc:///qtwebchannel/qwebchannel.js"></script>
+<script src="app://monaco/vs/loader.js"></script>
+<script>
+  var editor = null;
+  var bridge = null;
+  var suppressDirty = false;
+
+  require.config({ paths: { vs: 'app://monaco/vs' } });
+
+  require(['vs/editor/editor.main'], function () {
+    editor = monaco.editor.create(document.getElementById('container'), {
+      value: '',
+      language: 'c',
+      theme: 'vs-dark',
+      fontSize: 14,
+      minimap: { enabled: true },
+      automaticLayout: true,
+      scrollBeyondLastLine: false,
+      renderWhitespace: 'selection',
+      fixedOverflowWidgets: true,
+      tabSize: 4,
+      insertSpaces: true
+    });
+
+    // Ctrl+S -> Python 保存
+    editor.addCommand(monaco.KeyMod.CtrlCmd | monaco.KeyCode.KeyS, function () {
+      if (bridge) bridge.save_requested(editor.getValue());
+    });
+
+    editor.onDidChangeModelContent(function () {
+      if (bridge && !suppressDirty) bridge.content_changed();
+    });
+
+    new QWebChannel(qt.webChannelTransport, function (channel) {
+      bridge = channel.objects.bridge;
+      bridge.editor_ready();
+    });
+  });
+
+  /* ---- Python 调用的全局函数 ---- */
+  function setText(text) {
+    if (!editor) return;
+    suppressDirty = true;
+    editor.setValue(text);
+    suppressDirty = false;
+  }
+
+  function getText() {
+    return editor ? editor.getValue() : '';
+  }
+
+  function gotoLine(line, col) {
+    if (!editor) return;
+    editor.revealLineInCenter(line);
+    editor.setPosition({ lineNumber: line, column: col || 1 });
+    editor.focus();
+  }
+
+  /* markers: [{line, col, message, severity}] severity: 8=Error 4=Warning 2=Info */
+  function setMarkers(markersJson) {
+    if (!editor) return;
+    var markers = JSON.parse(markersJson).map(function (m) {
+      return {
+        startLineNumber: m.line, startColumn: m.col || 1,
+        endLineNumber: m.line, endColumn: (m.col || 1) + 200,
+        message: m.message,
+        severity: m.severity === 'error' ? monaco.MarkerSeverity.Error
+                : m.severity === 'warning' ? monaco.MarkerSeverity.Warning
+                : monaco.MarkerSeverity.Info
+      };
+    });
+    monaco.editor.setModelMarkers(editor.getModel(), 'gcc', markers);
+  }
+
+  function clearMarkers() {
+    if (editor) monaco.editor.setModelMarkers(editor.getModel(), 'gcc', []);
+  }
+</script>
+</body>
+</html>
