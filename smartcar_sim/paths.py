@@ -47,15 +47,16 @@ def new_work_dir(prefix: str) -> Path:
 
 
 def cleanup_old_runs(keep: int = 5) -> None:
-    """按修改时间清理旧的 run_* 目录，保留最近 keep 个。"""
+    """按修改时间清理旧的 run_*/build_*/objc_* 目录，各保留最近 keep 个。"""
     root = ensure_ascii_dir()
-    runs = sorted(
-        (p for p in root.glob("run_*") if p.is_dir()),
-        key=lambda p: p.stat().st_mtime,
-        reverse=True,
-    )
-    for p in runs[keep:]:
-        shutil.rmtree(p, ignore_errors=True)
+    for prefix in ("run_", "build_", "objc_"):
+        dirs = sorted(
+            (p for p in root.glob(prefix + "*") if p.is_dir()),
+            key=lambda p: p.stat().st_mtime,
+            reverse=True,
+        )
+        for p in dirs[keep:]:
+            shutil.rmtree(p, ignore_errors=True)
 
 
 def find_gcc() -> str | None:

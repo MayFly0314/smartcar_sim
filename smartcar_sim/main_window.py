@@ -1,6 +1,7 @@
 """主窗口：三区布局 + Run 流水线。"""
 from __future__ import annotations
 
+import hashlib
 from pathlib import Path
 
 from PySide6.QtCore import (
@@ -33,6 +34,7 @@ from PySide6.QtWidgets import (
 
 from .build.compiler import compile_sources
 from .build.diagnostics import CompileResult
+from .build.scan import scan_includes
 from .editor.monaco_widget import MonacoWidget
 from .imaging.loader import FrameSet, load_path
 from .paths import CSIM_DIR, cleanup_old_runs, new_work_dir
@@ -45,10 +47,50 @@ from .views.terminal import TerminalWidget
 from .views.timeline import Timeline
 
 
+def _read_c_text(p: Path) -> str:
+    """读 C 源文件并归一化换行为 \\n。
+
+    必须字节级读取：曾因保存未指定 newline 产生过 \\r\\r\\n 损坏
+    （文本模式 read_text 会把它读成两个换行，无法与真空行区分），
+    这里先把 \\r\\r\\n 修回 \\r\\n 再统一归一化。
+    """
+    raw = p.read_bytes()
+    try:
+        text = raw.decode("utf-8")
+    except UnicodeDecodeError:
+        text = raw.decode("gbk", errors="replace")
+    text = text.replace("\r\r\n", "\r\n")
+    return text.replace("\r\n", "\n").replace("\r", "\n")
+
+
+def _write_c_text(p: Path, text: str) -> None:
+    """统一 LF 落盘（newline="" 禁止平台换行翻译，防 \\r\\r\\n 复发）。"""
+    text = text.replace("\r\n", "\n").replace("\r", "\n")
+    with open(p, "w", encoding="utf-8", newline="") as f:
+        f.write(text)
+
+
 class _Worker(QObject):
     """常驻工作线程里的编译-运行执行器。"""
 
     finished = Signal(object, object)  # (CompileResult, RunResult|None)
+
+    def __init__(self):
+        super().__init__()
+        self._cache_key: tuple | None = None
+        self._cache_result: CompileResult | None = None
+
+    @staticmethod
+    def _sources_key(c_files: list[Path], h_files: list[Path], w: int, h: int, gcc: str) -> tuple | None:
+        """所有参与文件的内容哈希；文件读不到返回 None（此时不缓存）。"""
+        digest = hashlib.sha1()
+        try:
+            for f in sorted([*c_files, *h_files]):
+                digest.update(str(f).encode("utf-8", "replace"))
+                digest.update(f.read_bytes())
+        except OSError:
+            return None
+        return (digest.hexdigest(), w, h, gcc)
 
     @Slot(object)
     def do_run(self, job: dict) -> None:
@@ -56,7 +98,22 @@ class _Worker(QObject):
             src: Path = job["src"]
             fs: FrameSet = job["fs"]
             w, h = fs.w, fs.h
-            cr: CompileResult = compile_sources([src], w, h, gcc=job["gcc"] or None)
+            c_files, h_files = scan_includes(src)
+            key = self._sources_key(c_files, h_files, w, h, job["gcc"] or "")
+            if (
+                key is not None
+                and key == self._cache_key
+                and self._cache_result is not None
+                and self._cache_result.exe_path is not None
+                and self._cache_result.exe_path.exists()
+            ):
+                cr = self._cache_result  # 源码没变，跳过编译
+            else:
+                cr = compile_sources(
+                    c_files, w, h, gcc=job["gcc"] or None, header_files=h_files
+                )
+                if cr.ok and key is not None:
+                    self._cache_key, self._cache_result = key, cr
             if not cr.ok:
                 self.finished.emit(cr, None)
                 return
@@ -223,7 +280,7 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         if not fn:
             return
         p = Path(fn)
-        p.write_text(self._NEW_TEMPLATE, encoding="utf-8")
+        _write_c_text(p, self._NEW_TEMPLATE)
         self._load_c_file(p)
 
     def _open_c_file(self) -> None:
@@ -233,10 +290,7 @@ void image_process(uint8_t img[IMG_H][IMG_W])
             self._load_c_file(Path(fn))
 
     def _load_c_file(self, p: Path) -> None:
-        try:
-            text = p.read_text(encoding="utf-8")
-        except UnicodeDecodeError:
-            text = p.read_text(encoding="gbk", errors="replace")
+        text = _read_c_text(p)
         self.current_file = p
         self.settings.last_workspace = str(p.parent)
         self.settings.last_file = str(p)
@@ -284,7 +338,7 @@ void image_process(uint8_t img[IMG_H][IMG_W])
                 return
             self.current_file = Path(fn)
             self.settings.last_workspace = str(self.current_file.parent)
-        self.current_file.write_text(text, encoding="utf-8")
+        _write_c_text(self.current_file, text)
         self.editor.mark_saved()
         self._update_title()
         self.statusBar().showMessage(f"已保存 {self.current_file.name}")
@@ -324,7 +378,10 @@ void image_process(uint8_t img[IMG_H][IMG_W])
                 QMessageBox.information(self, "提示", "请先打开 C 文件")
                 self._act_watch.setChecked(False)
                 return
-            self._watcher = QFileSystemWatcher([str(self.current_file)], self)
+            # 一并监听 include 的依赖文件，改任何一个都自动重跑
+            c_files, h_files = scan_includes(self.current_file)
+            watch = [str(p) for p in {*c_files, *h_files}]
+            self._watcher = QFileSystemWatcher(watch, self)
             self._watcher.fileChanged.connect(self._on_external_change)
             self.editor.setEnabled(False)
             self.statusBar().showMessage(
@@ -353,8 +410,8 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         if self.current_file is None or self._running:
             return
         try:
-            text = self.current_file.read_text(encoding="utf-8")
-        except (OSError, UnicodeDecodeError):
+            text = _read_c_text(self.current_file)
+        except OSError:
             return
         self.editor.set_text(text)  # 同步显示到内嵌编辑器（只读展示）
         # 直接编译运行磁盘上的文件，不回写（回写会再次触发 watcher 造成循环）
@@ -384,7 +441,7 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         self.editor.get_text_async(self._run_after_save)
 
     def _run_after_save(self, text: str) -> None:
-        self.current_file.write_text(text, encoding="utf-8")
+        _write_c_text(self.current_file, text)
         self.editor.mark_saved()
         self.editor.clear_markers()
         self.console.clear_all()
@@ -511,7 +568,7 @@ void image_process(uint8_t img[IMG_H][IMG_W])
                 ws.mkdir(parents=True, exist_ok=True)
                 target = ws / demo.name
                 if not target.exists():
-                    target.write_text(demo.read_text(encoding="utf-8"), encoding="utf-8")
+                    _write_c_text(target, _read_c_text(demo))
                 self._load_c_file(target)
 
         self.editor.ready.connect(when_ready)

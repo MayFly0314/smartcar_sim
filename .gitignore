@@ -25,3 +25,6 @@ examples/tracks/
 # IDE
 .vscode/
 .idea/
+
+# AI 工具本地记忆（atomcode 等），属个人笔记非项目代码
+.atomcode/

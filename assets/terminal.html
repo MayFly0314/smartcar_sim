@@ -14,6 +14,7 @@
 <script src="qrc:///qtwebchannel/qwebchannel.js"></script>
 <script src="app://app/xterm/xterm.js"></script>
 <script src="app://app/xterm/addon-fit.js"></script>
+<script src="app://app/xterm/addon-webgl.js"></script>
 <script>
   var term = new Terminal({
     fontFamily: 'Consolas, "Courier New", monospace',
@@ -28,6 +29,12 @@
   var fit = new FitAddon.FitAddon();
   term.loadAddon(fit);
   term.open(document.getElementById('term'));
+  // WebGL 渲染器：全屏 TUI（claude 等）重绘快一个量级；不可用时回退 DOM
+  try {
+    var webgl = new WebglAddon.WebglAddon();
+    webgl.onContextLoss(function () { webgl.dispose(); });
+    term.loadAddon(webgl);
+  } catch (e) { /* 显卡/驱动不支持则用默认渲染 */ }
   fit.fit();
 
   var bridge = null;

@@ -1,6 +1,8 @@
 """QSettings 封装。"""
 from __future__ import annotations
 
+from pathlib import Path
+
 from PySide6.QtCore import QSettings
 
 from .paths import find_gcc
@@ -31,7 +33,13 @@ class Settings:
 
     @property
     def gcc_path(self) -> str:
-        return str(self._s.value("gcc_path", "") or "") or (find_gcc() or "")
+        saved = str(self._s.value("gcc_path", "") or "")
+        if saved and Path(saved).is_file():
+            return saved
+        found = find_gcc() or ""
+        if found:
+            self._s.setValue("gcc_path", found)  # 写回，避免每次编译都扫 PATH
+        return found
 
     @gcc_path.setter
     def gcc_path(self, v: str) -> None:
