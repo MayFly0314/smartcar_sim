@@ -90,3 +90,17 @@ void sim_plot(const char *name, float value)
     write_escaped(g_draw_fp, name);
     fprintf(g_draw_fp, " %g\n", (double)value);
 }
+
+void sim_tag(int x, int y, const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+    if (!g_draw_fp) return;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    /* 坐标不裁剪：越界 tag 出现在列表里反而帮用户发现 bug */
+    fprintf(g_draw_fp, "A %d %d ", x, y);
+    write_escaped(g_draw_fp, buf);
+    fputc('\n', g_draw_fp);
+}

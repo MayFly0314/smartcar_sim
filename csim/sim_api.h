@@ -54,6 +54,10 @@ void sim_log(const char *fmt, ...);
 /* ===== 数值监视（跨帧曲线：误差/状态/打角等）===== */
 void sim_plot(const char *name, float value);
 
+/* ===== 位置标注（不画到图上；图上悬停查看，或看图像下方"本帧标注"列表）
+ * 给某坐标附加一条说明，同一帧可多次调用（如逐个拐点标注类型）。 */
+void sim_tag(int x, int y, const char *fmt, ...);
+
 /* 当前帧号（0 起）。仅调试用，勿参与算法逻辑！ */
 int sim_frame_index(void);
 

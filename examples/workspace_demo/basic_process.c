@@ -2,11 +2,14 @@
 #include "basic_process.h"
 #include <stdlib.h>
 #include <string.h>
-
+#define TOO_FAR 100
 int max_white_x =0;//最长白列横坐标
 int max_length;//最长白列的长度
 int left_boundary[IMG_H];
 int right_boundary[IMG_H];
+int road_width[IMG_H];
+uint8_t left_boundary_valid[IMG_H];
+uint8_t right_boundary_valid[IMG_H];
 int center[IMG_H]; //静态全局变量，全局可以拿到中线的数据
 corner_t corner_list[MAX_CORNERS];
 int left_lost_rows=0;
@@ -110,8 +113,13 @@ void scan_lines(uint8_t img[IMG_H][IMG_W])
 {
     int x,y;
     //初始化左边界数组，右边界数组，左右丢线数
-    memset(left_boundary,-1,sizeof(left_boundary));
-    memset(right_boundary,-1,sizeof(right_boundary));
+    for(y=0;y<IMG_H;y++)
+    {
+        left_boundary[y]=0;
+        right_boundary[y]=IMG_W-1;
+    }
+    memset(left_boundary_valid,0,sizeof(left_boundary_valid));
+    memset(right_boundary_valid,0,sizeof(right_boundary_valid));
     memset(center,-1,sizeof(center));
     left_lost_rows=0;
     right_lost_rows=0;
@@ -123,6 +131,7 @@ void scan_lines(uint8_t img[IMG_H][IMG_W])
             if(img[y][x]==WHITE&&img[y][x-1]==BLACK)
             {
                 left_boundary[y]=x;
+                left_boundary_valid[y]=1;
                 break;
             }
         }
@@ -134,15 +143,21 @@ void scan_lines(uint8_t img[IMG_H][IMG_W])
             if(img[y][x]==WHITE&&img[y][x+1]==BLACK)
             {
                 right_boundary[y]=x;
+                right_boundary_valid[y]=1;
                 break;
             }
         }
     }
+
+    //保存补线前的原始赛道宽度，边界有效性由对应valid数组单独表示
+    for(y=0;y<IMG_H;y++)
+        road_width[y]=right_boundary[y]-left_boundary[y];
+
     for(y=IMG_H-1;y>=IMG_H-max_length;y--)
     {
-        if(left_boundary[y]<0)left_lost_rows++;
-        if(right_boundary[y]<0)right_lost_rows++;
-        if(left_boundary[y]>0&&right_boundary[y]>0)center[y]=(left_boundary[y]+right_boundary[y])/2;
+        if(!left_boundary_valid[y])left_lost_rows++;
+        if(!right_boundary_valid[y])right_lost_rows++;
+        center[y]=(left_boundary[y]+right_boundary[y])/2;
     }
     //计算中线方差
     {
@@ -160,6 +175,7 @@ void scan_lines(uint8_t img[IMG_H][IMG_W])
                 if(center[y]>=0)
                     center_var+=(center[y]-mean)*(center[y]-mean);
             }
+            center_var/=cnt;
         }
         else center_var=0;
     }
@@ -178,17 +194,13 @@ void find_corner_down(int start_line,int end_line)
     {
         if( //判断左下拐点，未找到才添加
             corner_list[0].type==CORNER_NONE&&
-            abs(left_boundary[y]-left_boundary[y+1])<3&& // 拐点下方附近差值较小
-            abs(left_boundary[y]-left_boundary[y+2])<5&&
-            abs(left_boundary[y]-left_boundary[y+3])<7&&
-            abs(left_boundary[y]-left_boundary[y-1])>3&&  //拐点上方附近差值较大
-            abs(left_boundary[y]-left_boundary[y-2])>8&&
-            abs(left_boundary[y]-left_boundary[y-3])>10&&
-            left_boundary[y]>0&&                           //平滑测不能有丢线
-            left_boundary[y+1]>0&&
-            left_boundary[y+2]>0&&
-            left_boundary[y+3]>0&&
-            left_boundary[y]>EDGE_WARNING                  //不考虑屏幕边界附近的拐点
+            max_white_x-left_boundary[y]<TOO_FAR&&
+            abs(left_boundary[y]-left_boundary[y+1])<=3&& // 拐点下方平滑侧变化较小
+            abs(left_boundary[y]-left_boundary[y+2])<=5&&
+            abs(left_boundary[y]-left_boundary[y+3])<=7&&
+            left_boundary[y]-left_boundary[y-1]>3&&  // 上方撕裂侧在顶点左侧
+            left_boundary[y]-left_boundary[y-2]>5&&
+            left_boundary[y]-left_boundary[y-3]>7
             )
         {
                 corner_list[0].x=left_boundary[y];
@@ -198,19 +210,14 @@ void find_corner_down(int start_line,int end_line)
         }
         if( //判断右下拐点，未找到才添加
             corner_list[2].type==CORNER_NONE&&
-            abs(right_boundary[y]-right_boundary[y+1])<3&&
-            abs(right_boundary[y]-right_boundary[y+2])<5&&
-            abs(right_boundary[y]-right_boundary[y+3])<7&&
-            abs(right_boundary[y]-right_boundary[y-1])>3&&
-            abs(right_boundary[y]-right_boundary[y-2])>8&&
-            abs(right_boundary[y]-right_boundary[y-3])>10&&
-            right_boundary[y]>0&&
-            right_boundary[y+1]>0&&
-            right_boundary[y+2]>0&&
-            right_boundary[y+3]>0&&
-            
-            right_boundary[y]<IMG_W-1-EDGE_WARNING         //不考虑屏幕边界的拐点
-        )
+            right_boundary[y]-max_white_x<TOO_FAR&&
+            abs(right_boundary[y]-right_boundary[y+1])<=3&&
+            abs(right_boundary[y]-right_boundary[y+2])<=5&&
+            abs(right_boundary[y]-right_boundary[y+3])<=7&&
+            right_boundary[y-1]-right_boundary[y]>3&&  // 上方撕裂侧在顶点右侧
+            right_boundary[y-2]-right_boundary[y]>5&&
+            right_boundary[y-3]-right_boundary[y]>7
+            )
         {
                 corner_list[2].x=right_boundary[y];
                 corner_list[2].y=y;
@@ -231,19 +238,16 @@ void find_corner_up(int start_line,int end_line)
     int safe_start=(start_line>IMG_H-4)?IMG_H-4:start_line;//防止y+3越界
     for(y=safe_start;y>end_line&&y>IMG_H-max_length+3;y--)//从下往上找，不超过赛道区域
     {
+
         if( //判断左上拐点，未找到才添加
             corner_list[1].type==CORNER_NONE&&
-            abs(left_boundary[y]-left_boundary[y-1])<3&& // 拐点上方附近差值较小
-            abs(left_boundary[y]-left_boundary[y-2])<5&&
-            abs(left_boundary[y]-left_boundary[y-3])<7&&
-            abs(left_boundary[y]-left_boundary[y+1])>3&&  //拐点下方附近差值较大
-            abs(left_boundary[y]-left_boundary[y+2])>8&&
-            abs(left_boundary[y]-left_boundary[y+3])>10&&
-            left_boundary[y]>0&&                           //平滑测不能有丢线
-            left_boundary[y-1]>0&&
-            left_boundary[y-2]>0&&
-            left_boundary[y-3]>0&&
-            left_boundary[y]>EDGE_WARNING
+            max_white_x-left_boundary[y]<TOO_FAR&&
+            abs(left_boundary[y]-left_boundary[y-1])<=3&& // 拐点上方平滑侧变化较小
+            abs(left_boundary[y]-left_boundary[y-2])<=5&&
+            abs(left_boundary[y]-left_boundary[y-3])<=7&&
+            left_boundary[y]-left_boundary[y+1]>3&&  // 下方撕裂侧在顶点左侧
+            left_boundary[y]-left_boundary[y+2]>6&&
+            left_boundary[y]-left_boundary[y+3]>9
             )
         {
                 corner_list[1].x=left_boundary[y];
@@ -252,18 +256,14 @@ void find_corner_up(int start_line,int end_line)
         }
         if( //判断右上拐点，未找到才添加
             corner_list[3].type==CORNER_NONE&&
-            abs(right_boundary[y]-right_boundary[y-1])<3&&
-            abs(right_boundary[y]-right_boundary[y-2])<5&&
-            abs(right_boundary[y]-right_boundary[y-3])<7&&
-            abs(right_boundary[y]-right_boundary[y+1])>3&&
-            abs(right_boundary[y]-right_boundary[y+2])>8&&
-            abs(right_boundary[y]-right_boundary[y+3])>10&&
-            right_boundary[y]>0&&
-            right_boundary[y-1]>0&&
-            right_boundary[y-2]>0&&
-            right_boundary[y-3]>0&&
-            right_boundary[y]<IMG_W-1-EDGE_WARNING
-        )
+            right_boundary[y]-max_white_x<TOO_FAR&&
+            abs(right_boundary[y]-right_boundary[y-1])<=3&&
+            abs(right_boundary[y]-right_boundary[y-2])<=5&&
+            abs(right_boundary[y]-right_boundary[y-3])<=7&&
+            right_boundary[y+1]-right_boundary[y]>3&&
+            right_boundary[y+2]-right_boundary[y]>5&&
+            right_boundary[y+3]-right_boundary[y]>7
+            )
         {
                 corner_list[3].x=right_boundary[y];
                 corner_list[3].y=y;
@@ -272,4 +272,3 @@ void find_corner_up(int start_line,int end_line)
     }
 }
 //打印左右边界和中线 和拐点
-

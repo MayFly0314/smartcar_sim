@@ -1,17 +1,29 @@
 """draw.txt / frames_out.bin 解析 -> 帧结果数据结构。"""
 from __future__ import annotations
 
-import re
 from dataclasses import dataclass, field
 from pathlib import Path
 
 import numpy as np
 
-_PCT_RE = re.compile(r"%([0-9a-fA-F]{2})")
-
 
 def _unescape(s: str) -> str:
-    return _PCT_RE.sub(lambda m: chr(int(m.group(1), 16)), s)
+    """%xx 为字节转义（C 侧 write_escaped 按字节写 UTF-8），按字节收集后整体解码。"""
+    if "%" not in s:
+        return s
+    out = bytearray()
+    i, n = 0, len(s)
+    while i < n:
+        if s[i] == "%" and i + 2 < n:
+            try:
+                out.append(int(s[i + 1:i + 3], 16))
+                i += 3
+                continue
+            except ValueError:
+                pass
+        out += s[i].encode("utf-8")
+        i += 1
+    return out.decode("utf-8", errors="replace")
 
 
 @dataclass
@@ -27,6 +39,7 @@ class FrameResult:
     index: int
     cmds: list[DrawCmd] = field(default_factory=list)
     watches: dict[str, float] = field(default_factory=dict)
+    tags: list[tuple[int, int, str]] = field(default_factory=list)  # (x, y, text)
     t_us: float = 0.0
 
 
@@ -82,11 +95,15 @@ def parse_draw_file(path: Path) -> list[FrameResult]:
                 )
             elif tag == "V" and len(parts) == 3:
                 cur.watches[_unescape(parts[1])] = float(parts[2])
+            elif tag == "A" and len(parts) >= 3:
+                # 空文本时行尾无第 4 段
+                cur.tags.append((int(parts[1]), int(parts[2]),
+                                 _unescape(parts[3]) if len(parts) >= 4 else ""))
         except (ValueError, IndexError):
             continue  # 坏行容错
 
     # 尾部无 F 行的残帧（崩溃时）也保留
-    if cur.cmds or cur.watches:
+    if cur.cmds or cur.watches or cur.tags:
         frames.append(cur)
     return frames
 

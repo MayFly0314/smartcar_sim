@@ -43,8 +43,10 @@ from .run.runner import run_sim
 from .settings import Settings
 from .views.console import Console
 from .views.image_view import ImageView
+from .views.tag_panel import TagPanel
 from .views.terminal import TerminalWidget
 from .views.timeline import Timeline
+from .views.watch_panel import WatchPanel
 
 
 def _read_c_text(p: Path) -> str:
@@ -166,6 +168,8 @@ class MainWindow(QMainWindow):
         self.console = Console()
         self.timeline = Timeline()
         self.terminal = TerminalWidget()
+        self.watch_panel = WatchPanel()
+        self.tag_panel = TagPanel()
 
         self.chk_processed = QCheckBox("处理后")
         self.chk_overlay = QCheckBox("叠加")
@@ -186,6 +190,8 @@ class MainWindow(QMainWindow):
         rlay.setSpacing(2)
         rlay.addLayout(view_bar)
         rlay.addWidget(self.image_view, 1)
+        rlay.addWidget(self.watch_panel)
+        rlay.addWidget(self.tag_panel)
         rlay.addWidget(self.timeline)
 
         h_split = QSplitter(Qt.Orientation.Horizontal)
@@ -216,6 +222,8 @@ class MainWindow(QMainWindow):
         self.console.jump_requested.connect(self._jump_to)
         self.image_view.pixel_hovered.connect(self._on_pixel)
         self.timeline.frame_changed.connect(self._show_frame)
+        self.watch_panel.frame_selected.connect(self.timeline.goto)
+        self.tag_panel.tag_selected.connect(self.image_view.set_highlight)
         self.chk_processed.toggled.connect(lambda _: self._show_frame(self.timeline.current()))
         self.chk_overlay.toggled.connect(self._on_overlay_toggle)
 
@@ -321,6 +329,8 @@ void image_process(uint8_t img[IMG_H][IMG_W])
             return
         self.frameset = fs
         self.run_result = None
+        self.watch_panel.clear()
+        self.tag_panel.clear()
         self.settings.last_image = str(p)
         self.timeline.set_range(fs.count)
         self.image_view.reset_fit()
@@ -478,6 +488,8 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         if rr is None:
             return
         self.run_result = rr
+        self.watch_panel.set_run(rr.frames)
+        self.tag_panel.set_run(rr.frames)
         if rr.crashed:
             where = f"第 {rr.crash_frame} 帧" if rr.crash_frame >= 0 else "启动时"
             self.console.append_error(f"运行崩溃（{where}）：{rr.error_msg}")
@@ -512,6 +524,8 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         if rr is not None and idx < len(rr.frames):
             fr = rr.frames[idx]
         self.image_view.show_frame(base, fr)
+        self.watch_panel.set_current_frame(idx)
+        self.tag_panel.set_current_frame(idx)
 
     def _on_overlay_toggle(self, on: bool) -> None:
         self.image_view.set_overlay_visible(on)
@@ -598,7 +612,12 @@ _API_HELP_TEXT = """\
 
 【日志与监视】
   sim_log("otsu = %d", th);        打印到底部控制台，自动带[帧号]前缀
-  sim_plot("error", err);          记录数值随帧变化（曲线面板规划中）
+  sim_plot("error", err);          记录数值→图像下方监视面板（每变量一行：
+                                   当前帧值+跨帧曲线；点击曲线跳帧，悬停看值）
+  sim_tag(x, y, "L角点 t=%d", t);  给图上某位置附加说明（不画到图上）：
+                                   鼠标悬停该处弹出查看；图像下方"本帧标注"
+                                   列表逐条列出，点击行图上高亮该点。
+                                   同一帧可多次调用（逐个拐点标注类型/坐标）
   sim_frame_index();               当前帧号(0起)。仅调试用，别参与算法！
 
 【颜色常量】

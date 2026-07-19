@@ -11,6 +11,7 @@ typedef enum {
 extern road_type now_type;
 //图像处理
 void element_process(uint8_t img[IMG_H][IMG_W]);
+road_type identify_straight(void);
 void identify_road_type(void);
 void cross_process(uint8_t img[IMG_H][IMG_W]);
 //两点之间画直线（Bresenham算法），将直线上的点设为BLACK

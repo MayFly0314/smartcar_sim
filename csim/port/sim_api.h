@@ -39,6 +39,7 @@
 #define sim_draw_text(x, y, c, ...)            ((void)0)
 #define sim_log(...)                           ((void)0)
 #define sim_plot(name, value)                  ((void)0)
+#define sim_tag(x, y, ...)                     ((void)0)
 #define sim_frame_index()                      (0)
 
 void image_process(uint8_t img[IMG_H][IMG_W]);

@@ -4,7 +4,6 @@
 #define BLACK 0
 #define WHITE 255
 #define MAX_CORNERS 4   //4种拐点类型各占一个固定位置
-#define EDGE_WARNING 20  //定义边缘区域的检测，此范围内不考虑拐点存在
 typedef enum {
     //定义拐点类型的enum，四种类型对应有
     //如1对应右边边界向右边拐形成的拐点
@@ -24,6 +23,9 @@ typedef struct{
 
 extern  int left_boundary[IMG_H]; //左边界数组
 extern  int right_boundary[IMG_H];//右边界数组
+extern  int road_width[IMG_H];//原始左右边界之间的宽度
+extern  uint8_t left_boundary_valid[IMG_H];
+extern  uint8_t right_boundary_valid[IMG_H];
 extern  int center[IMG_H]; //静态全局变量，全局可以拿到中线的数据
 extern  corner_t corner_list[MAX_CORNERS];
 extern  int max_length;//最长白列的长度

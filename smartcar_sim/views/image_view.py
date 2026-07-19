@@ -1,20 +1,31 @@
-"""图像视图：缩放/平移/像素读数/图层合成（原图|处理后 + 叠加 + 文本）。"""
+"""图像视图：缩放/平移/像素读数/图层合成（原图|处理后 + 叠加 + 文本）+ tag 悬停/高亮。"""
 from __future__ import annotations
 
+import html
+
 import numpy as np
-from PySide6.QtCore import Qt, Signal, QRectF
+from PySide6.QtCore import Qt, Signal, QPointF, QRectF
 from PySide6.QtGui import QBrush, QColor, QFont, QImage, QPainter, QPen, QPixmap
 from PySide6.QtWidgets import (
     QGraphicsPixmapItem,
     QGraphicsScene,
     QGraphicsSimpleTextItem,
     QGraphicsView,
+    QToolTip,
 )
 
 from ..run.protocol import FrameResult
 from .overlay import render_overlay, text_items
 
 _GRID_MIN_SCALE = 8.0
+_TAG_HIT_PX = 12.0     # tag 悬停命中半径（屏幕像素）
+_HL_RADIUS_PX = 10.0   # 高亮环半径（屏幕像素）
+_HL_COLOR = QColor("#FFD500")
+
+
+def _tip_html(lines: list[str]) -> str:
+    """强制富文本 + 转义：防止文本里的 < 被 Qt 误判为 HTML 吞掉。"""
+    return "<div style='white-space:pre'>" + html.escape("\n".join(lines)) + "</div>"
 
 
 def gray_to_qimage(arr: np.ndarray) -> QImage:
@@ -48,6 +59,8 @@ class ImageView(QGraphicsView):
         self._gray: np.ndarray | None = None       # 当前底图数组（读像素用）
         self._show_overlay = True
         self._fitted = False
+        self._tags: list[tuple[int, int, str]] = []
+        self._highlight: tuple[int, int] | None = None
 
     # ---- 内容 ----
     def show_frame(
@@ -59,6 +72,11 @@ class ImageView(QGraphicsView):
         self._gray = base
         h, w = base.shape
         self._base_item.setPixmap(QPixmap.fromImage(gray_to_qimage(base)))
+
+        # tag 不渲染到图上，关"叠加"也应能悬停查看
+        self._tags = list(frame_result.tags) if frame_result is not None else []
+        self._highlight = None
+        QToolTip.hideText()  # 防播放时挂着上一帧的陈旧 tooltip
 
         for it in self._text_items:
             self._scene.removeItem(it)
@@ -91,6 +109,10 @@ class ImageView(QGraphicsView):
     def set_overlay_visible(self, on: bool) -> None:
         self._show_overlay = on
 
+    def set_highlight(self, x: int, y: int) -> None:
+        self._highlight = (x, y)
+        self.viewport().update()
+
     def reset_fit(self) -> None:
         self._fitted = False
 
@@ -114,20 +136,56 @@ class ImageView(QGraphicsView):
         else:
             self.pixel_hovered.emit(-1, -1, -1)
 
-    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802
-        """高倍缩放时画像素网格。"""
-        scale = self.transform().m11()
-        if scale < _GRID_MIN_SCALE or self._gray is None:
+        # tag 悬停（ScrollHandDrag 拖拽平移中不弹）
+        if ev.buttons() & Qt.MouseButton.LeftButton:
+            QToolTip.hideText()
             return
-        h, w = self._gray.shape
-        pen = QPen(QColor(128, 128, 128, 60))
-        pen.setCosmetic(True)
-        painter.setPen(pen)
-        x0 = max(0, int(rect.left()))
-        x1 = min(w, int(rect.right()) + 1)
-        y0 = max(0, int(rect.top()))
-        y1 = min(h, int(rect.bottom()) + 1)
-        for x in range(x0, x1 + 1):
-            painter.drawLine(x, y0, x, y1)
-        for y in range(y0, y1 + 1):
-            painter.drawLine(x0, y, x1, y)
+        near = self._tags_near(pt)
+        if near:
+            QToolTip.showText(
+                ev.globalPosition().toPoint(),
+                _tip_html([f"({tx}, {ty})  {t}" for tx, ty, t in near]),
+                self,
+            )
+        else:
+            QToolTip.hideText()
+
+    def _tags_near(self, pt) -> list[tuple[int, int, str]]:
+        if not self._tags:
+            return []
+        scale = self.transform().m11()
+        r = max(2.0, _TAG_HIT_PX / max(scale, 1e-6))
+        r2 = r * r
+        return [(x, y, t) for x, y, t in self._tags
+                if (x + 0.5 - pt.x()) ** 2 + (y + 0.5 - pt.y()) ** 2 <= r2]
+
+    def drawForeground(self, painter: QPainter, rect: QRectF) -> None:  # noqa: N802
+        """高倍缩放像素网格 + tag 高亮环。"""
+        if self._gray is None:
+            return
+        scale = self.transform().m11()
+        if scale >= _GRID_MIN_SCALE:
+            h, w = self._gray.shape
+            pen = QPen(QColor(128, 128, 128, 60))
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            x0 = max(0, int(rect.left()))
+            x1 = min(w, int(rect.right()) + 1)
+            y0 = max(0, int(rect.top()))
+            y1 = min(h, int(rect.bottom()) + 1)
+            for x in range(x0, x1 + 1):
+                painter.drawLine(x, y0, x, y1)
+            for y in range(y0, y1 + 1):
+                painter.drawLine(x0, y, x1, y)
+
+        if self._highlight is not None:
+            hx, hy = self._highlight
+            r = _HL_RADIUS_PX / max(scale, 1e-6)  # 屏幕恒定大小
+            pen = QPen(_HL_COLOR)
+            pen.setWidthF(2.0)
+            pen.setCosmetic(True)
+            painter.setPen(pen)
+            painter.setBrush(Qt.BrushStyle.NoBrush)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+            painter.drawEllipse(QPointF(hx + 0.5, hy + 0.5), r, r)
+            painter.setRenderHint(QPainter.RenderHint.Antialiasing, False)

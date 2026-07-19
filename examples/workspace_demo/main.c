@@ -19,16 +19,27 @@ void image_process(uint8_t img[IMG_H][IMG_W])
     //下面是打印部分，在图上显示出来
     for(y=IMG_H-1;y>=IMG_H-max_length;y--)
     {
-        if(left_boundary[y]>=0)sim_draw_point(left_boundary[y],y,SIM_RED);
+        if(left_boundary_valid[y])sim_draw_point(left_boundary[y],y,SIM_RED);
         else sim_draw_point(left_boundary[y],y,SIM_PURPLE);
-        if(right_boundary[y]>=0)sim_draw_point(right_boundary[y],y,SIM_GREEN);
+        if(right_boundary_valid[y])sim_draw_point(right_boundary[y],y,SIM_GREEN);
         else sim_draw_point(right_boundary[y],y,SIM_PURPLE);
         if(center[y]>=0)sim_draw_point(center[y],y,SIM_BLUE);
     }
     for(i=0;i<MAX_CORNERS;i++)
     {
         if(corner_list[i].type!=CORNER_NONE)
+        {
             sim_draw_cross(corner_list[i].x,corner_list[i].y,3,SIM_ORANGE);
+            switch(corner_list[i].type)
+            {
+                case 0: break;
+                case 1: sim_plot("corner_l_down",corner_list[i].x);break;
+                case 2: sim_plot("corner_l_up",corner_list[i].x);break;
+                case 3: sim_plot("corner_r_down",corner_list[i].x);break;
+                case 4: sim_plot("corner_r_up",corner_list[i].x);break;
+            }
+        }
+
     }
     /*for(i=0;i<IMG_H-1;i++)//画出最长白列
     {
@@ -44,6 +55,11 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         case 5:sim_draw_text(0,0,SIM_WHITE,"circle");break;
 
     }
-    if(max_length>=63)sim_draw_text(0,10,SIM_WHITE,"var=%d",center_var);
+    if(max_length>=63)sim_draw_text(0,10,SIM_WHITE,"var=%d",center_var);//如果最长白列比较长就输出下中线方差
+    sim_plot("left_lost_rows",left_lost_rows);
+    sim_plot("right_lost_rows",right_lost_rows);
+    sim_plot("max_white_x",max_white_x);
+    sim_draw_text(0,4,SIM_WHITE,"length:%d",max_length);
+
     
 }
