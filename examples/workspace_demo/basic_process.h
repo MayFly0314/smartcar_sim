@@ -32,12 +32,15 @@ extern  int max_length;//最长白列的长度
 extern  int max_white_x;//最长白列横坐标
 extern  int left_lost_rows;
 extern  int right_lost_rows;
+extern  int both_lost_rows;//最长白列范围内左右边界同时丢失的行数
 extern  int center_var;//中线方差，衡量中线离散程度
 
 //3x3滤波
 void filter_3x3(uint8_t img[IMG_H][IMG_W]);
 
 void find_longest_whiteline(uint8_t img[IMG_H][IMG_W]);
+//在指定横坐标范围内查找最长白列，结果仍写入max_white_x和max_length
+void find_longest_whiteline_range(uint8_t img[IMG_H][IMG_W],int start_x,int end_x);
 //扫线：查找左右边界数组和初步中线数组，结果存入模块内全局变量
 void scan_lines(uint8_t img[IMG_H][IMG_W]);
 

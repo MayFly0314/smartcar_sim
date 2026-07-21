@@ -1,5 +1,6 @@
 #include "basic_process.h"
 #include "identify.h"
+#include "circle.h"
 #include <stdlib.h>
 #define STRAIGHT_TH  59//直道判别标准
 #define TURN_TH 57
@@ -7,19 +8,18 @@
 #define STRAIGHT_FIT_MIN_POINTS 10   //拟合直道正常宽度趋势所需的最少有效行数
 #define STRAIGHT_WIDTH_MARGIN 10     //远端实际宽度允许超过直道预测宽度的像素余量
 #define STRAIGHT_WIDTH_CONSECUTIVE 5 //连续超过余量达到该行数时，不再判定为直道
+#define CROSS_CONTINUATION_FRAMES 2  //严格识别为十字后允许宽松识别的最大帧数
 int left_up_find,right_up_find,left_down_find,right_down_find;
 road_type now_type = DONT_KNOW;
+static int cross_continuation_left=0;
 
 /*
- *@brief 识别十字路口：先搜上拐点，确认后基于上拐点位置搜下拐点
+ *@brief 根据上拐点识别十字路口
+ *@param allow_single_up 是否允许仅找到一个上拐点时延续十字状态
  *@return CROSS（十字路口）或 DONT_KNOW（不是十字路口）
  */
-road_type identify_cross(void)
+static road_type identify_cross_corners(int allow_single_up)
 {
-    if(left_lost_rows<10||right_lost_rows<10)
-    {
-        return DONT_KNOW;
-    }
     left_up_find=0;right_up_find=0;
     //先搜索上拐点
     find_corner_up(IMG_H-1,0);
@@ -30,9 +30,29 @@ road_type identify_cross(void)
         //确认是十字路口，基于上拐点位置搜索下拐点
         int search_end=(corner_list[1].y<corner_list[3].y)?corner_list[1].y:corner_list[3].y;
         find_corner_down(IMG_H-1,search_end);
+
+        //同一侧上拐点必须位于下拐点上方，顺序反了就丢弃下拐点并保留上拐点延长
+        if(corner_list[0].type!=CORNER_NONE&&
+           corner_list[0].y<=corner_list[1].y)
+            corner_list[0].type=CORNER_NONE;
+        if(corner_list[2].type!=CORNER_NONE&&
+           corner_list[2].y<=corner_list[3].y)
+            corner_list[2].type=CORNER_NONE;
+
         return CROSS;
     }
-    else return DONT_KNOW;
+    if(allow_single_up&&(left_up_find||right_up_find))
+        return CROSS;
+    return DONT_KNOW;
+}
+
+/*
+ *@brief 严格识别十字路口，必须同时找到左右两个上拐点
+ *@return CROSS（十字路口）或 DONT_KNOW（不是十字路口）
+ */
+road_type identify_cross(void)
+{
+    return identify_cross_corners(0);
 }
 /*
  *@brief 识别赛道类型
@@ -93,6 +113,33 @@ road_type identify_straight(void)
 void identify_road_type(void)
 {
     now_type=DONT_KNOW;
+
+    //环岛入口确认后由环岛内部状态机接管，不再重复执行入口识别
+    if(circle_context.state!=CIRCLE_IDLE)
+    {
+        identify_circle_state();
+        now_type=CIRCLE;
+        return;
+    }
+
+    //严格十字后的两帧优先宽松识别；失败则当帧恢复正常判断
+    if(cross_continuation_left>0)
+    {
+        now_type=identify_cross_corners(1);
+        if(now_type==CROSS)
+        {
+            //当前帧仍满足严格十字条件时，以当前帧为起点刷新两帧预算
+            if(max_length>=STRAIGHT_TH&&
+               left_lost_rows>=10&&right_lost_rows>=10&&
+               left_up_find&&right_up_find)
+                cross_continuation_left=CROSS_CONTINUATION_FRAMES;
+            else
+                cross_continuation_left--;
+            return;
+        }
+        cross_continuation_left=0;
+    }
+
     if(max_length>=STRAIGHT_TH)//直线或十字路口或缓弯或未知
     {
         if(center_var<100&&left_lost_rows<10&&right_lost_rows<10&&identify_straight()==STRAIGHT)
@@ -102,8 +149,16 @@ void identify_road_type(void)
         }
         else
         {
-            //中线波动大，先搜上拐点判断是否十字路口
-            now_type=identify_cross();
+            //不是直道时先识别环岛，失败后再继续其他赛道类型判断
+            now_type=identify_circle();
+            if(now_type==DONT_KNOW&&
+               left_lost_rows>=10&&right_lost_rows>=10)
+            {
+                now_type=identify_cross();
+                if(now_type==CROSS)
+                    cross_continuation_left=CROSS_CONTINUATION_FRAMES;
+            }
+
             if(now_type==DONT_KNOW)
             {
                 //不是十字路口，根据丢线情况区分
@@ -239,6 +294,27 @@ void cross_process(uint8_t img[IMG_H][IMG_W])
     int right_up_x=corner_list[3].x,right_up_y=corner_list[3].y;
     int left_down_x=corner_list[0].x,left_down_y=corner_list[0].y;
     int right_down_x=corner_list[2].x,right_down_y=corner_list[2].y;
+
+    //出十字阶段只剩一个上拐点时，仅延长对应边界
+    if(left_up_find&&!right_up_find)
+    {
+        int center_start=left_up_y-4;
+        if(center_start<0)center_start=0;
+        left_lengthen(img,left_up_x,left_up_y);
+        for(y=center_start;y<IMG_H;y++)
+            center[y]=(left_boundary[y]+right_boundary[y])/2;
+        return;
+    }
+    if(!left_up_find&&right_up_find)
+    {
+        int center_start=right_up_y-4;
+        if(center_start<0)center_start=0;
+        right_lengthen(img,right_up_x,right_up_y);
+        for(y=center_start;y<IMG_H;y++)
+            center[y]=(left_boundary[y]+right_boundary[y])/2;
+        return;
+    }
+
     //根据已找到的拐点进行分类处理
     if(corner_list[0].type==CORNER_NONE&&corner_list[2].type==CORNER_NONE)
     {
@@ -337,7 +413,9 @@ void element_process(uint8_t img[IMG_H][IMG_W])
         case 4://十字路口，补线处理
             cross_process(img);
             break;
-        case 5:
+        case 5://环岛，根据内部状态和方向补线
+            circle_process(img);
+            break;
         default:
             break;
     }
