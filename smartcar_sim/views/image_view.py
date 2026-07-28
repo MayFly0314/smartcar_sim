@@ -59,6 +59,7 @@ class ImageView(QGraphicsView):
         self._gray: np.ndarray | None = None       # 当前底图数组（读像素用）
         self._show_overlay = True
         self._fitted = False
+        self._rot180 = False   # 显示旋转 180°（数据/坐标不动，只是正着看）
         self._tags: list[tuple[int, int, str]] = []
         self._highlight: tuple[int, int] | None = None
 
@@ -109,6 +110,13 @@ class ImageView(QGraphicsView):
     def set_overlay_visible(self, on: bool) -> None:
         self._show_overlay = on
 
+    def set_view_rot180(self, on: bool) -> None:
+        """显示旋转 180°（右下角原点约定下正着看图）。场景坐标不变，读数仍是约定坐标。"""
+        if on != self._rot180:
+            self._rot180 = on
+            self.rotate(180)
+            self.viewport().update()
+
     def set_highlight(self, x: int, y: int) -> None:
         self._highlight = (x, y)
         self.viewport().update()
@@ -119,7 +127,7 @@ class ImageView(QGraphicsView):
     # ---- 交互 ----
     def wheelEvent(self, ev) -> None:  # noqa: N802
         factor = 1.25 if ev.angleDelta().y() > 0 else 0.8
-        cur = self.transform().m11()
+        cur = abs(self.transform().m11())  # 旋转 180° 时 m11 为负，取绝对值
         if 0.2 <= cur * factor <= 80:
             self.scale(factor, factor)
             self.viewport().update()
@@ -153,7 +161,7 @@ class ImageView(QGraphicsView):
     def _tags_near(self, pt) -> list[tuple[int, int, str]]:
         if not self._tags:
             return []
-        scale = self.transform().m11()
+        scale = abs(self.transform().m11())
         r = max(2.0, _TAG_HIT_PX / max(scale, 1e-6))
         r2 = r * r
         return [(x, y, t) for x, y, t in self._tags
@@ -163,7 +171,7 @@ class ImageView(QGraphicsView):
         """高倍缩放像素网格 + tag 高亮环。"""
         if self._gray is None:
             return
-        scale = self.transform().m11()
+        scale = abs(self.transform().m11())  # 旋转 180° 时 m11 为负
         if scale >= _GRID_MIN_SCALE:
             h, w = self._gray.shape
             pen = QPen(QColor(128, 128, 128, 60))

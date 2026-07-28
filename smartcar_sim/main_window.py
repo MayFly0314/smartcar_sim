@@ -18,7 +18,9 @@ from PySide6.QtGui import QAction, QDesktopServices, QKeySequence
 from PySide6.QtWidgets import (
     QApplication,
     QCheckBox,
+    QComboBox,
     QDialog,
+    QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
     QLabel,
@@ -26,6 +28,7 @@ from PySide6.QtWidgets import (
     QMessageBox,
     QPlainTextEdit,
     QPushButton,
+    QSpinBox,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -36,13 +39,15 @@ from .build.compiler import compile_sources
 from .build.diagnostics import CompileResult
 from .build.scan import scan_includes
 from .editor.monaco_widget import MonacoWidget
-from .imaging.loader import FrameSet, load_path
+from .imaging.loader import FrameSet, guess_raw_layout, load_path, load_raw
+from .link.serial_link import HAVE_PYSERIAL
 from .paths import CSIM_DIR, cleanup_old_runs, new_work_dir
 from .run.protocol import RunResult
 from .run.runner import run_sim
 from .settings import Settings
 from .views.console import Console
 from .views.image_view import ImageView
+from .views.serial_dialog import SerialDialog
 from .views.tag_panel import TagPanel
 from .views.terminal import TerminalWidget
 from .views.timeline import Timeline
@@ -70,6 +75,90 @@ def _write_c_text(p: Path, text: str) -> None:
     text = text.replace("\r\n", "\n").replace("\r", "\n")
     with open(p, "w", encoding="utf-8", newline="") as f:
         f.write(text)
+
+
+class _RawParamDialog(QDialog):
+    """SD raw 参数：分辨率 / 每帧帧头字节，配 guess_raw_layout 候选下拉 + 整除预览。"""
+
+    def __init__(self, total_bytes: int, w0: int, h0: int, parent=None) -> None:
+        super().__init__(parent)
+        self.setWindowTitle("SD 原始数据参数")
+        self._total = int(total_bytes)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel(f"文件大小：{self._total} 字节"))
+
+        self._combo = QComboBox()
+        self._combo.addItem("（手动指定）", None)
+        for w, h, n in guess_raw_layout(self._total):
+            self._combo.addItem(f"{w}×{h} → {n} 帧", (w, h))
+        self._combo.currentIndexChanged.connect(self._apply_candidate)
+        row = QHBoxLayout()
+        row.addWidget(QLabel("候选布局"))
+        row.addWidget(self._combo, 1)
+        lay.addLayout(row)
+
+        self._spin_w = QSpinBox()
+        self._spin_w.setRange(1, 8192)
+        self._spin_w.setValue(w0)
+        self._spin_h = QSpinBox()
+        self._spin_h.setRange(1, 8192)
+        self._spin_h.setValue(h0)
+        self._spin_hdr = QSpinBox()
+        self._spin_hdr.setRange(0, 65536)
+        self._spin_hdr.setValue(0)
+        self._spin_ftr = QSpinBox()
+        self._spin_ftr.setRange(0, 65536)
+        self._spin_ftr.setValue(0)
+        for text, wdg in (
+            ("宽", self._spin_w),
+            ("高", self._spin_h),
+            ("每帧帧头字节", self._spin_hdr),
+            ("每帧帧尾字节", self._spin_ftr),
+        ):
+            r = QHBoxLayout()
+            r.addWidget(QLabel(text))
+            r.addWidget(wdg, 1)
+            lay.addLayout(r)
+
+        self._preview = QLabel()
+        self._preview.setWordWrap(True)
+        self._preview.setStyleSheet("color:#9cdcfe;")
+        lay.addWidget(self._preview)
+
+        bb = QDialogButtonBox(
+            QDialogButtonBox.StandardButton.Ok | QDialogButtonBox.StandardButton.Cancel
+        )
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        lay.addWidget(bb)
+
+        for wdg in (self._spin_w, self._spin_h, self._spin_hdr, self._spin_ftr):
+            wdg.valueChanged.connect(self._update_preview)
+        self._update_preview()
+
+    def _apply_candidate(self) -> None:
+        data = self._combo.currentData()
+        if data:
+            w, h = data
+            self._spin_w.setValue(w)
+            self._spin_h.setValue(h)
+
+    def _update_preview(self) -> None:
+        w, h, hdr, ftr = (
+            self._spin_w.value(), self._spin_h.value(),
+            self._spin_hdr.value(), self._spin_ftr.value(),
+        )
+        stride = hdr + w * h + ftr
+        n = self._total // stride if stride else 0
+        rem = self._total - n * stride if stride else self._total
+        note = "✓ 整除" if rem == 0 else f"⚠ 余 {rem} 字节将被丢弃"
+        self._preview.setText(f"每帧 {stride} 字节（头{hdr}+像素{w*h}+尾{ftr}）→ {n} 帧　{note}")
+
+    def result_params(self) -> tuple[int, int, int, int]:
+        return (
+            self._spin_w.value(), self._spin_h.value(),
+            self._spin_hdr.value(), self._spin_ftr.value(),
+        )
 
 
 class _Worker(QObject):
@@ -150,6 +239,9 @@ class MainWindow(QMainWindow):
         self._watch_timer = None
         self.current_file: Path | None = None
         self._running = False
+        self._online_run = False          # 串口在线逐帧跑标志（区别于普通 F5）
+        self._online_base = None          # 在线帧底图（结果回来时叠加用）
+        self._serial_dialog: SerialDialog | None = None
 
         # 常驻工作线程
         self._thread = QThread(self)
@@ -174,6 +266,15 @@ class MainWindow(QMainWindow):
         self.chk_processed = QCheckBox("处理后")
         self.chk_overlay = QCheckBox("叠加")
         self.chk_overlay.setChecked(True)
+        self.chk_load_rot = QCheckBox("载入转180°")
+        self.chk_load_rot.setToolTip(
+            "打开图像时旋转180°写入数据：适配「右下角=(0,0)」坐标约定\n"
+            "（摄像头倒装时算法直接以右下角为原点，正的赛道图需勾选此项）"
+        )
+        self.chk_load_rot.setChecked(self.settings.load_rot180)
+        self.chk_view_rot = QCheckBox("旋转显示")
+        self.chk_view_rot.setToolTip("显示时旋转180°正着看图；数据与坐标读数不变（仍为右下角原点约定）")
+        self.chk_view_rot.setChecked(self.settings.view_rot180)
         self.lbl_pixel = QLabel("")
         self.lbl_pixel.setStyleSheet("color:#9cdcfe; font-family:Consolas")
 
@@ -181,6 +282,8 @@ class MainWindow(QMainWindow):
         view_bar.setContentsMargins(4, 2, 4, 2)
         view_bar.addWidget(self.chk_processed)
         view_bar.addWidget(self.chk_overlay)
+        view_bar.addWidget(self.chk_load_rot)
+        view_bar.addWidget(self.chk_view_rot)
         view_bar.addStretch(1)
         view_bar.addWidget(self.lbl_pixel)
 
@@ -226,6 +329,10 @@ class MainWindow(QMainWindow):
         self.tag_panel.tag_selected.connect(self.image_view.set_highlight)
         self.chk_processed.toggled.connect(lambda _: self._show_frame(self.timeline.current()))
         self.chk_overlay.toggled.connect(self._on_overlay_toggle)
+        self.chk_load_rot.toggled.connect(self._on_load_rot_toggle)
+        self.chk_view_rot.toggled.connect(self._on_view_rot_toggle)
+        if self.settings.view_rot180:
+            self.image_view.set_view_rot180(True)
 
         self._restore_session()
 
@@ -236,6 +343,7 @@ class MainWindow(QMainWindow):
         self._add_action(m_file, "打开 C 文件...", "Ctrl+O", self._open_c_file)
         self._add_action(m_file, "打开图像...", "Ctrl+I", self._open_image)
         self._add_action(m_file, "打开图像文件夹...", "Ctrl+Shift+I", self._open_image_folder)
+        self._add_action(m_file, "打开 SD 原始数据(raw)...", None, self._open_sd_raw)
         m_file.addSeparator()
         self._add_action(m_file, "保存代码", "Ctrl+S", self._request_save)
         self._add_action(m_file, "在资源管理器中打开代码位置", None, self._reveal_workspace)
@@ -249,10 +357,8 @@ class MainWindow(QMainWindow):
         self._act_watch.setCheckable(True)
 
         m_link = self.menuBar().addMenu("连接(&L)")
-        a_serial = self._add_action(m_link, "串口（待实现）", None, lambda: None)
-        a_bt = self._add_action(m_link, "蓝牙（待实现）", None, lambda: None)
-        a_serial.setEnabled(False)
-        a_bt.setEnabled(False)
+        self._add_action(m_link, "串口图传...", None, self._open_serial_dialog)
+        self._add_action(m_link, "蓝牙图传（SPP，同串口）...", None, self._open_serial_dialog)
 
         m_help = self.menuBar().addMenu("帮助(&H)")
         self._add_action(m_help, "API 速查（画线/日志/移植）", "F1", self._show_api_help)
@@ -327,15 +433,97 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "加载失败", str(e))
             return
+        if self.settings.load_rot180:
+            # 右下角原点约定：正的赛道图旋转 180° 后 [0][0] = 原图右下角
+            fs = fs.rotated180()
+        self.settings.last_image = str(p)
+        self.load_frameset(fs, f"已加载 {fs.count} 帧 {fs.w}x{fs.h}")
+
+    def load_frameset(self, fs: FrameSet, label: str) -> None:
+        """统一注入口：本地文件 / 串口抓取 / SD raw 三条路的帧都经此进入运行流水线。"""
         self.frameset = fs
         self.run_result = None
         self.watch_panel.clear()
         self.tag_panel.clear()
-        self.settings.last_image = str(p)
         self.timeline.set_range(fs.count)
         self.image_view.reset_fit()
         self._show_frame(0)
-        self.statusBar().showMessage(f"已加载 {fs.count} 帧 {fs.w}x{fs.h}")
+        self.statusBar().showMessage(label)
+
+    # ---- 串口图传 ----
+    def _open_serial_dialog(self) -> None:
+        if not HAVE_PYSERIAL:
+            QMessageBox.warning(
+                self, "缺少依赖",
+                "串口图传需要 pyserial。\n请在下方“终端”标签里运行：pip install pyserial",
+            )
+            return
+        if self._serial_dialog is None:
+            self._serial_dialog = SerialDialog(self.settings, self)
+            self._serial_dialog.frames_captured.connect(self._on_serial_frames)
+            self._serial_dialog.frame_online.connect(self.run_single_frame)
+        self._serial_dialog.show()
+        self._serial_dialog.raise_()
+        self._serial_dialog.activateWindow()
+
+    def _on_serial_frames(self, fs: FrameSet, label: str) -> None:
+        self.load_frameset(fs, f"{label}（已加载，按 F5 跑算法）")
+
+    def run_single_frame(self, frame) -> None:
+        """串口在线模式：把单帧当 1 帧 FrameSet 跑一次算法并叠加显示。
+
+        用现成 self._running 节流——上一帧没跑完就丢掉中间帧，算法慢自动降帧率。
+        **不动 self.frameset/timeline/面板**——在线帧只临时喂给运行器、结果直接画到图像视图，
+        用户已加载的多帧序列与时间轴保持不变（退出在线即恢复正常）。
+        走磁盘上已保存的 .c（不逐帧回写编辑器）；编译缓存保证只有 sim.exe 每帧重跑。
+        """
+        if self._running or self.current_file is None:
+            return
+        try:
+            fs = FrameSet.from_frames([frame])
+        except Exception:  # noqa: BLE001
+            return
+        self._online_base = frame     # 结果回来时作为底图叠加
+        self._online_run = True
+        self._running = True
+        self._run_requested.emit({
+            "src": self.current_file,
+            "fs": fs,                 # 仅本次运行用，不写入 self.frameset
+            "gcc": self.settings.gcc_path,
+            "timeout": self.settings.timeout_base,
+        })
+
+    # ---- SD 卡原始数据 ----
+    def _open_sd_raw(self) -> None:
+        start = self.settings.last_sd_raw or self.settings.last_image or str(Path.home())
+        fn, _ = QFileDialog.getOpenFileName(
+            self, "打开 SD 原始数据（多帧连续灰度 raw）", start,
+            "原始数据 (*.bin *.raw *.dat);;所有文件 (*)",
+        )
+        if not fn:
+            return
+        p = Path(fn)
+        try:
+            total = p.stat().st_size
+        except OSError as e:
+            QMessageBox.warning(self, "读取失败", str(e))
+            return
+        dlg = _RawParamDialog(total, self.settings.img_w, self.settings.img_h, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        w, h, header_bytes, footer_bytes = dlg.result_params()
+        try:
+            fs = load_raw(
+                p, w, h, header_bytes=header_bytes,
+                frame_stride=header_bytes + w * h + footer_bytes,
+            )
+        except Exception as e:  # noqa: BLE001
+            QMessageBox.warning(self, "解析失败", str(e))
+            return
+        self.settings.last_sd_raw = str(p)
+        self.settings.img_w = w
+        self.settings.img_h = h
+        self.load_frameset(fs, f"SD raw {p.name} · {fs.count} 帧 {fs.w}×{fs.h}")
 
     def _request_save(self) -> None:
         self.editor.get_text_async(self._save_text)
@@ -448,15 +636,23 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         if self.current_file is None:
             QMessageBox.information(self, "提示", "请先打开或保存 C 文件（Ctrl+O）")
             return
+        # 原子占位：get_text_async 是异步往返 Monaco，若此刻不占位，
+        # 在线模式下一帧串口图像会在空窗里插队跑掉，绕过节流。
+        self._running = True
         self.editor.get_text_async(self._run_after_save)
 
     def _run_after_save(self, text: str) -> None:
-        _write_c_text(self.current_file, text)
+        self._running = True  # 冗余保险（_run_pipeline 已置）；外部编辑等路径也经此
+        try:
+            _write_c_text(self.current_file, text)
+        except OSError as e:
+            self._running = False  # 写盘失败要复位，否则卡在"运行中"
+            QMessageBox.warning(self, "保存失败", str(e))
+            return
         self.editor.mark_saved()
         self.editor.clear_markers()
         self.console.clear_all()
         self.console.append_info(f"编译 {self.current_file.name} ...")
-        self._running = True
         self.statusBar().showMessage("编译运行中...")
         self._run_requested.emit({
             "src": self.current_file,
@@ -467,6 +663,16 @@ void image_process(uint8_t img[IMG_H][IMG_W])
 
     def _on_pipeline_done(self, cr: CompileResult, rr: RunResult | None) -> None:
         self._running = False
+        if self._online_run:
+            # 串口在线逐帧：结果直接画到图像视图，不碰 self.frameset/timeline/面板/控制台（否则刷屏、错乱）
+            self._online_run = False
+            if (
+                cr.ok and rr is not None and not rr.crashed and rr.frames
+                and self._online_base is not None
+            ):
+                self.image_view.show_frame(self._online_base, rr.frames[0])
+            cleanup_old_runs()  # 在线会话不走下方正常清理，这里补清临时 run_* 目录
+            return
         if not cr.ok:
             self.console.append_error("编译失败：")
             if cr.friendly_error:
@@ -531,6 +737,23 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         self.image_view.set_overlay_visible(on)
         self._show_frame(self.timeline.current())
 
+    def _on_load_rot_toggle(self, on: bool) -> None:
+        self.settings.load_rot180 = on
+        # 当前已加载的帧就地翻转，重新运行前旧 run 叠加已不对应，直接清掉
+        if self.frameset is not None:
+            self.frameset = self.frameset.rotated180()
+            self.run_result = None
+            self.watch_panel.clear()
+            self.tag_panel.clear()
+            self._show_frame(self.timeline.current())
+        self.statusBar().showMessage(
+            "载入转180°：已开（数据以右下角为原点）" if on else "载入转180°：已关"
+        )
+
+    def _on_view_rot_toggle(self, on: bool) -> None:
+        self.settings.view_rot180 = on
+        self.image_view.set_view_rot180(on)
+
     def _on_pixel(self, x: int, y: int, v: int) -> None:
         self.lbl_pixel.setText(f"({x}, {y}) = {v}" if x >= 0 else "")
 
@@ -552,6 +775,8 @@ void image_process(uint8_t img[IMG_H][IMG_W])
 
     # ---- 会话恢复 ----
     def _shutdown_thread(self) -> None:
+        if self._serial_dialog is not None:
+            self._serial_dialog.shutdown()
         self._thread.quit()
         self._thread.wait(3000)
 

@@ -6,7 +6,7 @@
 void image_process(uint8_t img[IMG_H][IMG_W])
 {
     int y,i;
-    filter_3x3(img);
+   
 
     find_longest_whiteline(img);//得到最长白列长度，最长白列横坐标
     scan_lines(img);//得到左右边界数组，中线数组，左右丢线数
@@ -15,7 +15,8 @@ void image_process(uint8_t img[IMG_H][IMG_W])
     
     identify_road_type();//得到此帧赛道类型
 
-    element_process(img);
+    if(now_type==CROSS)
+    cross_process(img);
 
     //下面是打印部分，在图上显示出来
     for(y=IMG_H-1;y>=IMG_H-max_length;y--)

@@ -15,13 +15,12 @@ void element_process(uint8_t img[IMG_H][IMG_W]);
 road_type identify_straight(void);
 road_type identify_circle(void);
 void identify_road_type(void);
-
+extern int left_up_find;
+extern int right_up_find;
+extern int left_down_find;
+extern int right_down_find;
 void cross_process(uint8_t img[IMG_H][IMG_W]);
 //两点之间画直线（Bresenham算法），将直线上的点设为BLACK
-void linktwo(uint8_t img[IMG_H][IMG_W],int x1,int y1,int x2,int y2);
-//左侧单点向下延伸：以拐点及往上4行处边界点拟合直线，延伸至底部
-void left_lengthen(uint8_t img[IMG_H][IMG_W],int x,int y);
-//右侧单点向下延伸：以拐点及往上4行处边界点拟合直线，延伸至底部
-void right_lengthen(uint8_t img[IMG_H][IMG_W],int x,int y);
+
 
 #endif

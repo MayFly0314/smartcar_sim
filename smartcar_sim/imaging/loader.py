@@ -61,6 +61,23 @@ class FrameSet:
         """按帧顺序写出连续 uint8 供 sim.exe 读取。"""
         self.frames.astype(np.uint8, copy=False).tofile(dst)
 
+    @classmethod
+    def from_frames(cls, frames: list[np.ndarray]) -> "FrameSet":
+        """从内存中的 (H, W) uint8 帧列表构造（串口抓取 / raw 解析共用）。
+
+        paths 全仓库无消费方，内存来源留空即可。
+        """
+        if not frames:
+            raise ValueError("帧列表为空")
+        arr = np.stack([np.ascontiguousarray(f, dtype=np.uint8) for f in frames])
+        return cls(frames=arr, paths=[])
+
+    def rotated180(self) -> "FrameSet":
+        """整组帧旋转 180°（右下角原点约定：正图旋转后 [0][0]=原图右下角）。"""
+        return FrameSet(
+            frames=np.ascontiguousarray(self.frames[:, ::-1, ::-1]), paths=self.paths
+        )
+
 
 def load_single(path: str | Path) -> FrameSet:
     p = Path(path)
@@ -98,3 +115,60 @@ def load_path(path: str | Path) -> FrameSet:
     """自动判断：文件 -> 单帧；文件夹 -> 序列。"""
     p = Path(path)
     return load_folder(p) if p.is_dir() else load_single(p)
+
+
+# ---- SD 卡原始数据（raw）解析 ----
+# 单片机把摄像头灰度帧写进 SD 卡最常见的形式是"多帧 uint8 连续拼接"的裸二进制，
+# 与本仿真器喂给 sim.exe 的 input.bin 完全同构，因此可直接 np.fromfile + reshape 还原。
+
+_RAW_CANDIDATES = ((188, 120), (160, 120), (80, 60), (94, 60), (320, 240))
+
+
+def load_raw(
+    path: str | Path,
+    w: int,
+    h: int,
+    header_bytes: int = 0,
+    frame_stride: int | None = None,
+) -> FrameSet:
+    """把单个 raw 文件按 (n, h, w) 还原成帧序列。
+
+    - w, h：单帧灰度分辨率（MCU 侧 img[H][W] 行优先，reshape 直接对上，无需转置）。
+    - header_bytes：每帧数据前的固定帧头字节数（无则 0），解析时跳过。
+    - frame_stride：每帧总步长，默认 header_bytes + w*h；当每帧尾部另有填充/校验时可显式给更大值。
+
+    末尾不足一整帧的余数丢弃。字节数不足一帧时抛 ValueError。
+    """
+    if w <= 0 or h <= 0:
+        raise ValueError("分辨率必须为正")
+    per = w * h
+    stride = int(frame_stride) if frame_stride else header_bytes + per
+    if stride < header_bytes + per:
+        raise ValueError(f"帧步长 {stride} 小于 帧头 {header_bytes} + 像素 {per}")
+    data = np.fromfile(str(path), dtype=np.uint8)
+    n = data.size // stride
+    if n == 0:
+        raise ValueError(
+            f"字节数 {data.size} 不足一帧（每帧需 {stride} 字节 = {header_bytes} 帧头 + {w}×{h}）"
+        )
+    body = data[: n * stride].reshape(n, stride)[:, header_bytes : header_bytes + per]
+    return FrameSet(frames=body.reshape(n, h, w), paths=[])
+
+
+def guess_raw_layout(
+    total: int, candidates: tuple[tuple[int, int], ...] = _RAW_CANDIDATES
+) -> list[tuple[int, int, int]]:
+    """从总字节数猜测可能的 (w, h, 帧数)：能整除且帧数≥1 的候选分辨率。
+
+    宽度猜错时画面会斜向撕裂，配合 UI 即时预览可一眼判定选哪个。
+    """
+    seen: set[tuple[int, int]] = set()
+    out: list[tuple[int, int, int]] = []
+    for w, h in candidates:
+        if (w, h) in seen:
+            continue
+        seen.add((w, h))
+        per = w * h
+        if per > 0 and total % per == 0 and total // per >= 1:
+            out.append((w, h, total // per))
+    return out
