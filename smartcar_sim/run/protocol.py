@@ -40,6 +40,7 @@ class FrameResult:
     cmds: list[DrawCmd] = field(default_factory=list)
     watches: dict[str, float] = field(default_factory=dict)
     tags: list[tuple[int, int, str]] = field(default_factory=list)  # (x, y, text)
+    traces: list[tuple[int, str]] = field(default_factory=list)  # (-1=节点, 0=条件✗, 1=条件✓, 文本)
     t_us: float = 0.0
 
 
@@ -99,11 +100,15 @@ def parse_draw_file(path: Path) -> list[FrameResult]:
                 # 空文本时行尾无第 4 段
                 cur.tags.append((int(parts[1]), int(parts[2]),
                                  _unescape(parts[3]) if len(parts) >= 4 else ""))
+            elif tag == "E" and len(parts) >= 2:
+                cur.traces.append((-1, _unescape(parts[1])))
+            elif tag == "K" and len(parts) >= 3:
+                cur.traces.append((1 if parts[1] == "1" else 0, _unescape(parts[2])))
         except (ValueError, IndexError):
             continue  # 坏行容错
 
     # 尾部无 F 行的残帧（崩溃时）也保留
-    if cur.cmds or cur.watches or cur.tags:
+    if cur.cmds or cur.watches or cur.tags or cur.traces:
         frames.append(cur)
     return frames
 

@@ -158,3 +158,12 @@ class Settings:
     @view_rot180.setter
     def view_rot180(self, v: bool) -> None:
         self._s.setValue("view_rot180", bool(v))
+
+    @property
+    def record_scheme(self) -> str:
+        """数据记录方案（JSON），由记录方案设计器读写。"""
+        return str(self._s.value("record_scheme", "") or "")
+
+    @record_scheme.setter
+    def record_scheme(self, v: str) -> None:
+        self._s.setValue("record_scheme", v)

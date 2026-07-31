@@ -58,6 +58,15 @@ void sim_plot(const char *name, float value);
  * 给某坐标附加一条说明，同一帧可多次调用（如逐个拐点标注类型）。 */
 void sim_tag(int x, int y, const char *fmt, ...);
 
+/* ===== 执行流程追踪（图像下方"本帧流程"面板，随时间轴逐帧显示）=====
+ * sim_trace：记录一个流程节点——到了哪一步/进了哪个分支（printf 风格）。
+ * SIM_COND：原位包住 if 条件，自动记录该条件本帧为 ✓ 或 ✗，返回值即条件本身：
+ *     if (SIM_COND(max_length >= 59 && left_lost_rows >= 10)) { ... }
+ * 移植零差异：port 版 SIM_COND(expr) 直接展开为 (expr)，车上行为与写裸条件完全一致。 */
+void sim_trace(const char *fmt, ...);
+int  sim_cond_(int value, const char *expr);   /* 内部实现，勿直接调用 */
+#define SIM_COND(expr)  sim_cond_((expr) ? 1 : 0, #expr)
+
 /* 当前帧号（0 起）。仅调试用，勿参与算法逻辑！ */
 int sim_frame_index(void);
 

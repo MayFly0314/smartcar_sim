@@ -97,3 +97,28 @@ def test_parse_stdout_logs():
 
 def test_missing_draw_file(tmp_path):
     assert parse_draw_file(tmp_path / "nope.txt") == []
+
+
+def test_trace_lines(tmp_path):
+    p = tmp_path / "draw.txt"
+    p.write_text(
+        "E %e8%bf%9b%e5%85%a5%e5%8d%81%e5%ad%97\n"   # sim_trace("进入十字")
+        "K 1 max_length%3e%3d59\n"                    # 条件真
+        "K 0 left_lost%3e%3d10\n"                     # 条件假
+        "F 0 100\n",
+        encoding="utf-8",
+    )
+    frames = parse_draw_file(p)
+    assert len(frames) == 1
+    tr = frames[0].traces
+    assert tr[0] == (-1, "进入十字")
+    assert tr[1] == (1, "max_length>=59")
+    assert tr[2] == (0, "left_lost>=10")
+
+
+def test_trace_tail_frame_kept(tmp_path):
+    # 只有 trace、无 F 行的残帧（崩溃场景）也要保留
+    p = tmp_path / "draw.txt"
+    p.write_text("E node\nK 1 x\n", encoding="utf-8")
+    frames = parse_draw_file(p)
+    assert len(frames) == 1 and len(frames[0].traces) == 2

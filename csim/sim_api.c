@@ -104,3 +104,26 @@ void sim_tag(int x, int y, const char *fmt, ...)
     write_escaped(g_draw_fp, buf);
     fputc('\n', g_draw_fp);
 }
+
+void sim_trace(const char *fmt, ...)
+{
+    char buf[256];
+    va_list ap;
+    if (!g_draw_fp) return;
+    va_start(ap, fmt);
+    vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    fprintf(g_draw_fp, "E ");
+    write_escaped(g_draw_fp, buf);
+    fputc('\n', g_draw_fp);
+}
+
+int sim_cond_(int value, const char *expr)
+{
+    if (g_draw_fp) {
+        fprintf(g_draw_fp, "K %d ", value ? 1 : 0);
+        write_escaped(g_draw_fp, expr);
+        fputc('\n', g_draw_fp);
+    }
+    return value;
+}

@@ -47,10 +47,12 @@ from .run.runner import run_sim
 from .settings import Settings
 from .views.console import Console
 from .views.image_view import ImageView
+from .views.record_dialog import RecordDialog
 from .views.serial_dialog import SerialDialog
 from .views.tag_panel import TagPanel
 from .views.terminal import TerminalWidget
 from .views.timeline import Timeline
+from .views.trace_panel import TracePanel
 from .views.watch_panel import WatchPanel
 
 
@@ -241,7 +243,10 @@ class MainWindow(QMainWindow):
         self._running = False
         self._online_run = False          # 串口在线逐帧跑标志（区别于普通 F5）
         self._online_base = None          # 在线帧底图（结果回来时叠加用）
+        self._frames_are_local = False    # 当前帧来自本地图像文件（载入翻转仅对其生效）
+        self._record_params: list[tuple[str, list[float]]] = []  # 车端记录的参数（并入监视）
         self._serial_dialog: SerialDialog | None = None
+        self._record_dialog: RecordDialog | None = None
 
         # 常驻工作线程
         self._thread = QThread(self)
@@ -262,6 +267,7 @@ class MainWindow(QMainWindow):
         self.terminal = TerminalWidget()
         self.watch_panel = WatchPanel()
         self.tag_panel = TagPanel()
+        self.trace_panel = TracePanel()
 
         self.chk_processed = QCheckBox("处理后")
         self.chk_overlay = QCheckBox("叠加")
@@ -295,6 +301,7 @@ class MainWindow(QMainWindow):
         rlay.addWidget(self.image_view, 1)
         rlay.addWidget(self.watch_panel)
         rlay.addWidget(self.tag_panel)
+        rlay.addWidget(self.trace_panel)
         rlay.addWidget(self.timeline)
 
         h_split = QSplitter(Qt.Orientation.Horizontal)
@@ -344,6 +351,7 @@ class MainWindow(QMainWindow):
         self._add_action(m_file, "打开图像...", "Ctrl+I", self._open_image)
         self._add_action(m_file, "打开图像文件夹...", "Ctrl+Shift+I", self._open_image_folder)
         self._add_action(m_file, "打开 SD 原始数据(raw)...", None, self._open_sd_raw)
+        self._add_action(m_file, "数据记录方案（压缩存图/参数）...", None, self._open_record_dialog)
         m_file.addSeparator()
         self._add_action(m_file, "保存代码", "Ctrl+S", self._request_save)
         self._add_action(m_file, "在资源管理器中打开代码位置", None, self._reveal_workspace)
@@ -437,14 +445,17 @@ void image_process(uint8_t img[IMG_H][IMG_W])
             # 右下角原点约定：正的赛道图旋转 180° 后 [0][0] = 原图右下角
             fs = fs.rotated180()
         self.settings.last_image = str(p)
+        self._frames_are_local = True
         self.load_frameset(fs, f"已加载 {fs.count} 帧 {fs.w}x{fs.h}")
 
     def load_frameset(self, fs: FrameSet, label: str) -> None:
         """统一注入口：本地文件 / 串口抓取 / SD raw 三条路的帧都经此进入运行流水线。"""
         self.frameset = fs
         self.run_result = None
+        self._record_params = []
         self.watch_panel.clear()
         self.tag_panel.clear()
+        self.trace_panel.clear()
         self.timeline.set_range(fs.count)
         self.image_view.reset_fit()
         self._show_frame(0)
@@ -467,6 +478,7 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         self._serial_dialog.activateWindow()
 
     def _on_serial_frames(self, fs: FrameSet, label: str) -> None:
+        self._frames_are_local = False  # 串口帧已是约定坐标，载入翻转不适用
         self.load_frameset(fs, f"{label}（已加载，按 F5 跑算法）")
 
     def run_single_frame(self, frame) -> None:
@@ -492,6 +504,36 @@ void image_process(uint8_t img[IMG_H][IMG_W])
             "gcc": self.settings.gcc_path,
             "timeout": self.settings.timeout_base,
         })
+
+    # ---- 数据记录方案 ----
+    def _open_record_dialog(self) -> None:
+        if self._record_dialog is None:
+            self._record_dialog = RecordDialog(self.settings, self)
+            self._record_dialog.record_loaded.connect(self._on_record_loaded)
+        self._record_dialog.show()
+        self._record_dialog.raise_()
+        self._record_dialog.activateWindow()
+
+    def _on_record_loaded(self, fs, label: str, params) -> None:
+        from .run.protocol import FrameResult
+
+        if fs is not None:
+            self._frames_are_local = False  # 记录帧已是约定坐标
+            self.load_frameset(fs, label)   # 内部会清面板与 _record_params
+            n = fs.count
+        else:
+            n = len(params[0][1]) if params else 0
+        if not params or n == 0:
+            return
+        # 车端记录的参数 → 监视面板（与 sim_plot 同一显示通道）；
+        # 保存下来，之后每次 F5 都并进运行结果，可与算法输出对比
+        self._record_params = [(name, [float(v) for v in col]) for name, col in params]
+        frames = [
+            FrameResult(index=i, watches={name: col[i] for name, col in self._record_params})
+            for i in range(n)
+        ]
+        self.watch_panel.set_run(frames)
+        self.watch_panel.set_current_frame(self.timeline.current())
 
     # ---- SD 卡原始数据 ----
     def _open_sd_raw(self) -> None:
@@ -523,6 +565,7 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         self.settings.last_sd_raw = str(p)
         self.settings.img_w = w
         self.settings.img_h = h
+        self._frames_are_local = False  # SD raw 已是约定坐标，载入翻转不适用
         self.load_frameset(fs, f"SD raw {p.name} · {fs.count} 帧 {fs.w}×{fs.h}")
 
     def _request_save(self) -> None:
@@ -694,8 +737,16 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         if rr is None:
             return
         self.run_result = rr
+        # 车端记录的参数并入本轮运行的监视（rec.前缀防与 sim_plot 重名），跨帧对比车/仿真行为
+        if self._record_params:
+            for fr in rr.frames:
+                i = fr.index
+                for name, col in self._record_params:
+                    if 0 <= i < len(col):
+                        fr.watches.setdefault(f"rec.{name}", col[i])
         self.watch_panel.set_run(rr.frames)
         self.tag_panel.set_run(rr.frames)
+        self.trace_panel.set_run(rr.frames)
         if rr.crashed:
             where = f"第 {rr.crash_frame} 帧" if rr.crash_frame >= 0 else "启动时"
             self.console.append_error(f"运行崩溃（{where}）：{rr.error_msg}")
@@ -732,6 +783,7 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         self.image_view.show_frame(base, fr)
         self.watch_panel.set_current_frame(idx)
         self.tag_panel.set_current_frame(idx)
+        self.trace_panel.set_current_frame(idx)
 
     def _on_overlay_toggle(self, on: bool) -> None:
         self.image_view.set_overlay_visible(on)
@@ -739,12 +791,19 @@ void image_process(uint8_t img[IMG_H][IMG_W])
 
     def _on_load_rot_toggle(self, on: bool) -> None:
         self.settings.load_rot180 = on
-        # 当前已加载的帧就地翻转，重新运行前旧 run 叠加已不对应，直接清掉
+        if self.frameset is not None and not self._frames_are_local:
+            # SD/串口帧天然是右下角原点约定，此开关对其无效（防误翻数据）
+            self.statusBar().showMessage(
+                "载入转180°只影响本地图像文件；当前 SD/串口帧已是约定坐标，未改动"
+            )
+            return
+        # 本地图：当前已加载的帧就地翻转，旧 run 叠加已不对应，直接清掉
         if self.frameset is not None:
             self.frameset = self.frameset.rotated180()
             self.run_result = None
             self.watch_panel.clear()
             self.tag_panel.clear()
+            self.trace_panel.clear()
             self._show_frame(self.timeline.current())
         self.statusBar().showMessage(
             "载入转180°：已开（数据以右下角为原点）" if on else "载入转180°：已关"
@@ -844,6 +903,14 @@ _API_HELP_TEXT = """\
                                    列表逐条列出，点击行图上高亮该点。
                                    同一帧可多次调用（逐个拐点标注类型/坐标）
   sim_frame_index();               当前帧号(0起)。仅调试用，别参与算法！
+
+【执行流程追踪 —— 快速定位"这帧为什么进/没进某分支"】
+  sim_trace("进入十字处理");        记录流程节点 → 图像下方"本帧流程"面板
+  if (SIM_COND(max_length >= 59 && left_lost >= 10)) { ... }
+      用 SIM_COND() 原位包住 if 条件：面板里自动逐帧显示该条件 ✓/✗
+      及条件原文。返回值就是条件本身，逻辑零改变；单片机上展开为 (expr)，
+      行为与裸条件完全一致，零开销。
+      逐帧拖时间轴对比 ✓/✗ 变化，一眼看出状态机在哪一帧走岔。
 
 【颜色常量】
   SIM_RED  SIM_GREEN  SIM_BLUE  SIM_YELLOW  SIM_CYAN
