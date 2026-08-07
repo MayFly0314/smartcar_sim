@@ -21,6 +21,8 @@ _GRID_MIN_SCALE = 8.0
 _TAG_HIT_PX = 12.0     # tag 悬停命中半径（屏幕像素）
 _HL_RADIUS_PX = 10.0   # 高亮环半径（屏幕像素）
 _HL_COLOR = QColor("#FFD500")
+_HUD_M = 12            # 状态板距视口边距
+_HUD_MAX_LINES = 8     # 最多显示几行，防刷屏
 
 
 def _tip_html(lines: list[str]) -> str:
@@ -60,6 +62,8 @@ class ImageView(QGraphicsView):
         self._show_overlay = True
         self._fitted = False
         self._rot180 = False   # 显示旋转 180°（数据/坐标不动，只是正着看）
+        self._hud_on = True    # 状态板：sim_draw_text 放大显示在视口角落
+        self._hud_texts: list[tuple[int, str]] = []   # (rgb, text)
         self._tags: list[tuple[int, int, str]] = []
         self._highlight: tuple[int, int] | None = None
 
@@ -87,18 +91,27 @@ class ImageView(QGraphicsView):
             ov = render_overlay(frame_result, w, h)
             self._overlay_item.setPixmap(QPixmap.fromImage(ov))
             self._overlay_item.setVisible(True)
-            font = QFont("Consolas", 9)
+            font = QFont("Consolas", 11)
+            font.setBold(True)
             for x, y, rgb, text in text_items(frame_result):
                 it = QGraphicsSimpleTextItem(text)
                 it.setFont(font)
                 it.setBrush(QBrush(QColor((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF)))
-                it.setPen(QPen(QColor(0, 0, 0, 180), 0.5))
+                it.setPen(QPen(QColor(0, 0, 0, 220), 2.0))  # 粗黑描边，浅色底图上也看得清
                 it.setPos(x, y)
                 it.setFlag(it.GraphicsItemFlag.ItemIgnoresTransformations)
+                it.setVisible(not self._hud_on)   # 状态板开着就不在图上重复画一遍
                 self._scene.addItem(it)
                 self._text_items.append(it)
         else:
             self._overlay_item.setVisible(False)
+
+        # 状态板只收 (0,0) 位置的文本（约定：状态文字锚定左上角原点）
+        # 其余位置的 T 指令（cross_type=x、CROSS 等调试标注）保留在图上锚点，不进状态板
+        self._hud_texts = (
+            [(rgb, t) for x, y, rgb, t in text_items(frame_result) if x == 0 and y == 0]
+            if frame_result is not None else []
+        )
 
         rect = QRectF(0, 0, w, h)
         self._scene.setSceneRect(rect)
@@ -106,9 +119,64 @@ class ImageView(QGraphicsView):
             self.fitInView(rect, Qt.AspectRatioMode.KeepAspectRatio)
             self.scale(0.95, 0.95)
             self._fitted = True
+        self.viewport().update()  # HUD 画在视口坐标系，场景脏标记不覆盖它，需显式触发
 
     def set_overlay_visible(self, on: bool) -> None:
         self._show_overlay = on
+
+    def set_hud_visible(self, on: bool) -> None:
+        """状态板开关：开=文字集中到视口角落大字板；关=回到图上锚点原位显示。
+
+        两者互斥，避免同一句话显示两遍（图上那份也就能被关掉了）。
+        """
+        self._hud_on = on
+        for it in self._text_items:
+            it.setVisible(not on)
+        self.viewport().update()
+
+    def paintEvent(self, ev) -> None:  # noqa: N802
+        """先由 QGraphicsView 画场景，再在视口坐标系叠状态板。
+
+        画在视口而非场景：不受缩放/旋转影响，字号恒定、永远正向、永远在最上层。
+        """
+        super().paintEvent(ev)
+        if not self._hud_on or not self._hud_texts:
+            return
+        p = QPainter(self.viewport())
+        p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
+        # Consolas 无中文字形，Windows 字体回退导致度量错乱、描边糊字
+        # Microsoft YaHei 在所有 Win10/11 系统均存在，中英文度量均准确
+        font = QFont("Microsoft YaHei", 13)
+        font.setBold(True)
+        p.setFont(font)
+        fm = p.fontMetrics()
+
+        pad, gap = 10, 4
+        lines = self._hud_texts[:_HUD_MAX_LINES]
+        wmax = max(fm.horizontalAdvance(t) for _c, t in lines)
+        lh = fm.height() + gap
+        box = QRectF(_HUD_M, _HUD_M, wmax + pad * 2, lh * len(lines) - gap + pad * 2)
+
+        p.setPen(Qt.PenStyle.NoPen)
+        p.setBrush(QColor(0, 0, 0, 165))          # 半透明黑底：任何底图上都读得清
+        p.drawRoundedRect(box, 6, 6)
+        p.setBrush(Qt.BrushStyle.NoBrush)
+        p.setPen(QPen(QColor(255, 255, 255, 40)))
+        p.drawRoundedRect(box, 6, 6)
+
+        y = box.top() + pad
+        for rgb, text in lines:
+            col = QColor((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF)
+            if col.lightness() < 110:             # 深色字在黑底上看不清，自动提亮
+                col = col.lighter(190)
+            r = QRectF(box.left() + pad, y, wmax, fm.height())
+            p.setPen(QColor(0, 0, 0, 200))        # 描边
+            for dx, dy in ((-1, 0), (1, 0), (0, -1), (0, 1)):
+                p.drawText(r.translated(dx, dy), Qt.AlignmentFlag.AlignLeft, text)
+            p.setPen(col)
+            p.drawText(r, Qt.AlignmentFlag.AlignLeft, text)
+            y += lh
+        p.end()
 
     def set_view_rot180(self, on: bool) -> None:
         """显示旋转 180°（右下角原点约定下正着看图）。场景坐标不变，读数仍是约定坐标。"""

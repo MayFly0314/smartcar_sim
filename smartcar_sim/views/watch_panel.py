@@ -1,15 +1,14 @@
-"""变量监视面板：sim_plot 记录的数值 -> 每变量一行（名 | 当前帧值 | 跨帧 sparkline）。
+"""变量监视面板：紧凑显示变量名与当前帧值，双击打开独立曲线窗口。
 
-点击/拖动 sparkline 跳帧；悬停显示 (帧号, 值)；标题条点击折叠。
-无任何 sim_plot 数据时面板自动隐藏。
+变量按可用宽度自动排成多列；标题条点击折叠。无数据时面板自动隐藏。
 """
 from __future__ import annotations
 
 import math
 from dataclasses import dataclass, field
 
-from PySide6.QtCore import QPointF, QRectF, Qt, Signal
-from PySide6.QtGui import QColor, QFont, QPainter, QPen
+from PySide6.QtCore import QRectF, QSize, Qt, Signal
+from PySide6.QtGui import QColor, QFont, QFontMetrics, QPainter, QPen
 from PySide6.QtWidgets import QScrollArea, QToolTip, QVBoxLayout, QWidget
 
 from ..run.protocol import FrameResult
@@ -18,16 +17,15 @@ _BG = QColor("#1e1e1e")
 _HEADER_BG = QColor("#2d2d2d")
 _NAME = QColor("#9cdcfe")
 _VALUE = QColor("#d4d4d4")
-_CURVE = QColor("#4ec9b0")
-_CURSOR = QColor("#569cd6")
 _MISSING = QColor("#808080")
+_DIVIDER = QColor("#383838")
+_HOVER_BG = QColor("#2a2d2e")
 
 _HEADER_H = 20
-_ROW_H = 22
-_NAME_W = 96
-_VALUE_W = 68
-_PAD = 3          # sparkline 上下留白
-_MARGIN = 6       # 行区左右边距
+_ROW_H = 24
+_CELL_MIN_W = 150
+_VALUE_W = 72
+_MARGIN = 6
 _MAX_VISIBLE_ROWS = 6
 
 
@@ -81,15 +79,23 @@ def _fmt(v: float | None) -> str:
     return f"{v:g}"
 
 
-class _WatchArea(QWidget):
-    """行区：一次 paintEvent 画所有行；命中测试纯算术。"""
+def _grid_columns(width: int) -> int:
+    """按可用宽度计算紧凑网格列数，窄窗口至少保留一列。"""
+    return max(1, int(width) // _CELL_MIN_W)
 
-    frame_selected = Signal(int)
+
+class _WatchArea(QWidget):
+    """紧凑变量网格：每格仅绘制变量名和当前帧值。"""
+
+    var_activated = Signal(str)   # 双击变量项 -> 变量名
+    layout_rows_changed = Signal(int)
 
     def __init__(self, parent=None):
         super().__init__(parent)
         self._data = WatchData()
         self._cur = 0
+        self._hover = -1
+        self._layout_rows = -1
         self.setMouseTracking(True)
         self._font = QFont("Consolas", 9)
 
@@ -97,6 +103,8 @@ class _WatchArea(QWidget):
     def set_data(self, data: WatchData) -> None:
         self._data = data
         self._cur = min(self._cur, max(0, data.frame_count - 1))
+        self._hover = -1
+        self._sync_layout_height()
         self.updateGeometry()
         self.update()
 
@@ -105,35 +113,45 @@ class _WatchArea(QWidget):
         self.update()
 
     def sizeHint(self):  # noqa: N802
-        from PySide6.QtCore import QSize
-        return QSize(200, _ROW_H * len(self._data.tracks))
+        return QSize(_CELL_MIN_W * 3, self._row_count() * _ROW_H)
 
     # ---- 几何 ----
-    def _spark_rect(self, row: int) -> QRectF:
-        sx = _MARGIN + _NAME_W + _VALUE_W
-        return QRectF(sx, row * _ROW_H, max(10, self.width() - sx - _MARGIN), _ROW_H)
+    def _column_count(self) -> int:
+        return _grid_columns(max(1, self.width()))
 
-    def _x_at(self, i: int, r: QRectF) -> float:
-        n = self._data.frame_count
-        if n <= 1:
-            return r.center().x()
-        return r.left() + i / (n - 1) * r.width()
+    def _row_count(self) -> int:
+        n = len(self._data.tracks)
+        cols = self._column_count()
+        return (n + cols - 1) // cols
 
-    def _y_at(self, v: float, t: WatchTrack, r: QRectF) -> float:
-        span = t.vmax - t.vmin
-        frac = (v - t.vmin) / span if span > 1e-9 else 0.5
-        return r.top() + _PAD + (1.0 - frac) * (r.height() - 2 * _PAD)
+    def _sync_layout_height(self) -> None:
+        rows = self._row_count()
+        height = rows * _ROW_H
+        if self.minimumHeight() != height:
+            self.setMinimumHeight(height)
+        if rows != self._layout_rows:
+            self._layout_rows = rows
+            self.layout_rows_changed.emit(rows)
 
-    def _frame_at_x(self, x: float, r: QRectF) -> int:
-        n = self._data.frame_count
-        if n <= 1 or r.width() <= 0:
-            return 0
-        i = round((x - r.left()) / r.width() * (n - 1))
-        return max(0, min(int(i), n - 1))
+    def _cell_rect(self, idx: int) -> QRectF:
+        cols = self._column_count()
+        cell_w = self.width() / cols
+        row, col = divmod(idx, cols)
+        return QRectF(col * cell_w, row * _ROW_H, cell_w, _ROW_H)
 
-    def _row_at_y(self, y: float) -> int:
-        row = int(y // _ROW_H)
-        return row if 0 <= row < len(self._data.tracks) else -1
+    def _index_at(self, pos) -> int:
+        if pos.x() < 0 or pos.y() < 0 or pos.x() >= self.width():
+            return -1
+        cols = self._column_count()
+        cell_w = self.width() / cols
+        col = min(cols - 1, int(pos.x() // cell_w))
+        row = int(pos.y() // _ROW_H)
+        idx = row * cols + col
+        return idx if 0 <= idx < len(self._data.tracks) else -1
+
+    def resizeEvent(self, ev) -> None:  # noqa: N802
+        super().resizeEvent(ev)
+        self._sync_layout_height()
 
     # ---- 绘制 ----
     def paintEvent(self, ev) -> None:  # noqa: N802
@@ -142,80 +160,70 @@ class _WatchArea(QWidget):
         p.setFont(self._font)
         data = self._data
 
-        for row, t in enumerate(data.tracks):
-            y0 = row * _ROW_H
-            r = self._spark_rect(row)
+        metrics = QFontMetrics(self._font)
+        for idx, t in enumerate(data.tracks):
+            r = self._cell_rect(idx)
+            if idx == self._hover:
+                p.fillRect(r, _HOVER_BG)
 
+            value_rect = QRectF(r.right() - _VALUE_W, r.top(), _VALUE_W - _MARGIN, r.height())
+            name_rect = QRectF(
+                r.left() + _MARGIN,
+                r.top(),
+                max(0.0, r.width() - _VALUE_W - 2 * _MARGIN),
+                r.height(),
+            )
+            name = metrics.elidedText(
+                t.name,
+                Qt.TextElideMode.ElideRight,
+                max(0, int(name_rect.width())),
+            )
             p.setPen(_NAME)
-            p.drawText(QRectF(_MARGIN, y0, _NAME_W - 4, _ROW_H),
+            p.drawText(name_rect,
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
-                       t.name)
+                       name)
             cur_v = t.values[self._cur] if self._cur < len(t.values) else None
             p.setPen(_VALUE if _finite(cur_v) else _MISSING)
-            p.drawText(QRectF(_MARGIN + _NAME_W, y0, _VALUE_W - 8, _ROW_H),
+            p.drawText(value_rect,
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                        _fmt(cur_v))
 
-            # 曲线（缺失点断段）
-            p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
-            pen = QPen(_CURVE)
-            pen.setWidthF(1.2)
-            p.setPen(pen)
-            seg: list[QPointF] = []
-            for i, v in enumerate(t.values):
-                if _finite(v):
-                    seg.append(QPointF(self._x_at(i, r), self._y_at(v, t, r)))
-                else:
-                    self._flush_segment(p, seg)
-                    seg = []
-            self._flush_segment(p, seg)
-            p.setRenderHint(QPainter.RenderHint.Antialiasing, False)
-
-            # 当前帧游标
-            cx = self._x_at(self._cur, r)
-            p.setPen(QPen(_CURSOR))
-            p.drawLine(QPointF(cx, r.top()), QPointF(cx, r.bottom()))
-            if _finite(cur_v):
-                p.setBrush(_CURSOR)
-                p.drawEllipse(QPointF(cx, self._y_at(cur_v, t, r)), 2.0, 2.0)
-                p.setBrush(Qt.BrushStyle.NoBrush)
+            p.setPen(QPen(_DIVIDER))
+            p.drawLine(r.bottomLeft(), r.bottomRight())
+            if idx % self._column_count() != self._column_count() - 1:
+                p.drawLine(r.topRight(), r.bottomRight())
         p.end()
 
-    @staticmethod
-    def _flush_segment(p: QPainter, seg: list[QPointF]) -> None:
-        if len(seg) >= 2:
-            p.drawPolyline(seg)
-        elif len(seg) == 1:
-            p.drawEllipse(seg[0], 1.5, 1.5)
-
     # ---- 交互 ----
-    def _seek(self, pos) -> None:
-        row = self._row_at_y(pos.y())
-        if row < 0:
+    def mouseDoubleClickEvent(self, ev) -> None:  # noqa: N802
+        """双击变量项，单独打开该变量的曲线窗口。"""
+        if ev.button() != Qt.MouseButton.LeftButton:
             return
-        r = self._spark_rect(row)
-        if r.left() <= pos.x() <= r.right():
-            self.frame_selected.emit(self._frame_at_x(pos.x(), r))
-
-    def mousePressEvent(self, ev) -> None:  # noqa: N802
-        if ev.button() == Qt.MouseButton.LeftButton:
-            self._seek(ev.position())
+        idx = self._index_at(ev.position())
+        if idx >= 0:
+            self.var_activated.emit(self._data.tracks[idx].name)
 
     def mouseMoveEvent(self, ev) -> None:  # noqa: N802
-        if ev.buttons() & Qt.MouseButton.LeftButton:
-            self._seek(ev.position())
-            return
-        row = self._row_at_y(ev.position().y())
-        if row >= 0:
-            r = self._spark_rect(row)
-            if r.left() <= ev.position().x() <= r.right():
-                t = self._data.tracks[row]
-                i = self._frame_at_x(ev.position().x(), r)
-                v = t.values[i] if i < len(t.values) else None
-                txt = f"帧 {i}｜{t.name} = {_fmt(v)}" if _finite(v) else f"帧 {i}｜{t.name}：无值"
-                QToolTip.showText(ev.globalPosition().toPoint(), txt, self)
-                return
+        idx = self._index_at(ev.position())
+        if idx != self._hover:
+            self._hover = idx
+            self.update()
+        if idx >= 0:
+            t = self._data.tracks[idx]
+            v = t.values[self._cur] if self._cur < len(t.values) else None
+            QToolTip.showText(
+                ev.globalPosition().toPoint(),
+                f"{t.name} = {_fmt(v)}",
+                self,
+            )
+        else:
+            QToolTip.hideText()
+
+    def leaveEvent(self, ev) -> None:  # noqa: N802
+        self._hover = -1
         QToolTip.hideText()
+        self.update()
+        super().leaveEvent(ev)
 
 
 class _Header(QWidget):
@@ -256,11 +264,11 @@ class _Header(QWidget):
 
 
 class WatchPanel(QWidget):
-    frame_selected = Signal(int)
+    var_activated = Signal(str, object)   # 双击 -> (变量名, 跨帧值列表)
 
-    def __init__(self, parent=None):
+    def __init__(self, parent=None, title: str = "监视"):
         super().__init__(parent)
-        self._header = _Header()
+        self._header = _Header(title)
         self._area = _WatchArea()
         self._scroll = QScrollArea()
         self._scroll.setWidget(self._area)
@@ -276,8 +284,22 @@ class WatchPanel(QWidget):
         lay.addWidget(self._scroll)
 
         self._header.toggled.connect(self._on_toggle)
-        self._area.frame_selected.connect(self.frame_selected)
+        self._area.var_activated.connect(self._on_var_activated)
+        self._area.layout_rows_changed.connect(self._update_scroll_height)
         self.setVisible(False)
+
+    def _on_var_activated(self, name: str) -> None:
+        for t in self._area._data.tracks:
+            if t.name == name:
+                self.var_activated.emit(name, list(t.values))
+                return
+
+    def values_of(self, name: str) -> list | None:
+        """取某变量的跨帧序列（曲线窗口刷新用）。"""
+        for t in self._area._data.tracks:
+            if t.name == name:
+                return list(t.values)
+        return None
 
     # ---- 对外 API ----
     def set_run(self, frames: list[FrameResult]) -> None:
@@ -286,8 +308,8 @@ class WatchPanel(QWidget):
             self.clear()
             return
         self._area.set_data(data)
-        rows = min(len(data.tracks), _MAX_VISIBLE_ROWS)
-        self._scroll.setFixedHeight(rows * _ROW_H)
+        self._header.set_count(len(data.tracks))
+        self._update_scroll_height(self._area._row_count())
         self.setVisible(True)
         self._scroll.setVisible(not self._header.collapsed)
 
@@ -296,7 +318,12 @@ class WatchPanel(QWidget):
 
     def clear(self) -> None:
         self._area.set_data(WatchData())
+        self._header.set_count(None)
         self.setVisible(False)
+
+    def _update_scroll_height(self, rows: int) -> None:
+        visible_rows = min(max(0, rows), _MAX_VISIBLE_ROWS)
+        self._scroll.setFixedHeight(visible_rows * _ROW_H)
 
     def _on_toggle(self) -> None:
         self._scroll.setVisible(not self._header.collapsed)

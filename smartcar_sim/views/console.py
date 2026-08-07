@@ -13,12 +13,17 @@ class Console(QTextBrowser):
     def __init__(self, parent=None):
         super().__init__(parent)
         self.setOpenLinks(False)
-        self.setStyleSheet(
-            "QTextBrowser { background:#1e1e1e; color:#d4d4d4;"
-            " font-family:Consolas,monospace; font-size:12px; }"
-        )
+        self.set_translucent(False)
         self._jump_targets: list[tuple[str, int, int]] = []
         self.anchorClicked.connect(self._on_anchor)
+
+    def set_translucent(self, on: bool) -> None:
+        """壁纸模式下半透明背景，字色不变。"""
+        bg = "rgba(30,30,30,165)" if on else "#1e1e1e"
+        self.setStyleSheet(
+            "QTextBrowser { background:%s; color:#d4d4d4;"
+            " font-family:Consolas,monospace; font-size:12px; }" % bg
+        )
 
     def _on_anchor(self, url: QUrl) -> None:
         s = url.toString()

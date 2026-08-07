@@ -167,3 +167,21 @@ class Settings:
     @record_scheme.setter
     def record_scheme(self, v: str) -> None:
         self._s.setValue("record_scheme", v)
+
+    # ---- 界面壁纸 ----
+    @property
+    def wallpaper_path(self) -> str:
+        return str(self._s.value("wallpaper_path", "") or "")
+
+    @wallpaper_path.setter
+    def wallpaper_path(self, v: str) -> None:
+        self._s.setValue("wallpaper_path", v)
+
+    @property
+    def wallpaper_dim(self) -> int:
+        """壁纸遮罩深浅 0~90（越大越暗，文字越清晰）。"""
+        return int(self._s.value("wallpaper_dim", 55))
+
+    @wallpaper_dim.setter
+    def wallpaper_dim(self, v: int) -> None:
+        self._s.setValue("wallpaper_dim", int(v))

@@ -6,7 +6,7 @@ ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT))
 
 from smartcar_sim.run.protocol import FrameResult  # noqa: E402
-from smartcar_sim.views.watch_panel import aggregate_watches  # noqa: E402
+from smartcar_sim.views.watch_panel import _grid_columns, aggregate_watches  # noqa: E402
 
 
 def _frame(idx: int, watches: dict[str, float]) -> FrameResult:
@@ -73,3 +73,9 @@ def test_aggregate_single_frame_and_empty():
     assert empty.empty
 
     assert aggregate_watches([]).empty
+
+
+def test_grid_columns_use_freed_waveform_width():
+    assert _grid_columns(149) == 1
+    assert _grid_columns(300) == 2
+    assert _grid_columns(700) == 4

@@ -23,6 +23,7 @@ from PySide6.QtWidgets import (
     QDialogButtonBox,
     QFileDialog,
     QHBoxLayout,
+    QInputDialog,
     QLabel,
     QMainWindow,
     QMessageBox,
@@ -53,6 +54,8 @@ from .views.tag_panel import TagPanel
 from .views.terminal import TerminalWidget
 from .views.timeline import Timeline
 from .views.trace_panel import TracePanel
+from .views.var_plot import VarPlotDialog
+from .views.wallpaper import WallpaperHost
 from .views.watch_panel import WatchPanel
 
 
@@ -244,9 +247,10 @@ class MainWindow(QMainWindow):
         self._online_run = False          # 串口在线逐帧跑标志（区别于普通 F5）
         self._online_base = None          # 在线帧底图（结果回来时叠加用）
         self._frames_are_local = False    # 当前帧来自本地图像文件（载入翻转仅对其生效）
-        self._record_params: list[tuple[str, list[float]]] = []  # 车端记录的参数（并入监视）
+        self._record_params: list[tuple[str, list[float]]] = []  # 车端记录面板的参数
         self._serial_dialog: SerialDialog | None = None
         self._record_dialog: RecordDialog | None = None
+        self._var_plots: dict[str, VarPlotDialog] = {}   # 变量名 -> 独立曲线窗口
 
         # 常驻工作线程
         self._thread = QThread(self)
@@ -266,6 +270,7 @@ class MainWindow(QMainWindow):
         self.timeline = Timeline()
         self.terminal = TerminalWidget()
         self.watch_panel = WatchPanel()
+        self.rec_panel = WatchPanel(title="车端记录")   # SD 记录的参数，独立于 sim_plot 监视
         self.tag_panel = TagPanel()
         self.trace_panel = TracePanel()
 
@@ -281,6 +286,14 @@ class MainWindow(QMainWindow):
         self.chk_view_rot = QCheckBox("旋转显示")
         self.chk_view_rot.setToolTip("显示时旋转180°正着看图；数据与坐标读数不变（仍为右下角原点约定）")
         self.chk_view_rot.setChecked(self.settings.view_rot180)
+        self.chk_hud = QCheckBox("状态板")
+        self.chk_hud.setToolTip(
+            "sim_draw_text 的显示方式（两者互斥，不会重复显示）：\n"
+            "  勾选 = 集中到图像左上角大字状态板（黑底描边，缩放/旋转下恒定醒目）\n"
+            "  取消 = 回到图上 (x,y) 锚点原位显示\n"
+            "看「长直/短直/十字」这类状态标签建议勾选"
+        )
+        self.chk_hud.setChecked(True)
         self.lbl_pixel = QLabel("")
         self.lbl_pixel.setStyleSheet("color:#9cdcfe; font-family:Consolas")
 
@@ -290,6 +303,7 @@ class MainWindow(QMainWindow):
         view_bar.addWidget(self.chk_overlay)
         view_bar.addWidget(self.chk_load_rot)
         view_bar.addWidget(self.chk_view_rot)
+        view_bar.addWidget(self.chk_hud)
         view_bar.addStretch(1)
         view_bar.addWidget(self.lbl_pixel)
 
@@ -300,6 +314,7 @@ class MainWindow(QMainWindow):
         rlay.addLayout(view_bar)
         rlay.addWidget(self.image_view, 1)
         rlay.addWidget(self.watch_panel)
+        rlay.addWidget(self.rec_panel)
         rlay.addWidget(self.tag_panel)
         rlay.addWidget(self.trace_panel)
         rlay.addWidget(self.timeline)
@@ -321,7 +336,14 @@ class MainWindow(QMainWindow):
         self.bottom_tabs.setCornerWidget(btn_restart)
         v_split.addWidget(self.bottom_tabs)
         v_split.setSizes([640, 220])
-        self.setCentralWidget(v_split)
+
+        # 壁纸宿主包住整个内容区；有壁纸时相关部件转半透明让其透出
+        self.wall = WallpaperHost()
+        wl = QVBoxLayout(self.wall)
+        wl.setContentsMargins(0, 0, 0, 0)
+        wl.addWidget(v_split)
+        self.setCentralWidget(self.wall)
+        self._apply_wallpaper(init=True)
 
         self._build_menu()
         self.statusBar().showMessage("就绪")
@@ -332,12 +354,14 @@ class MainWindow(QMainWindow):
         self.console.jump_requested.connect(self._jump_to)
         self.image_view.pixel_hovered.connect(self._on_pixel)
         self.timeline.frame_changed.connect(self._show_frame)
-        self.watch_panel.frame_selected.connect(self.timeline.goto)
+        self.watch_panel.var_activated.connect(self._open_var_plot)
+        self.rec_panel.var_activated.connect(self._open_var_plot)
         self.tag_panel.tag_selected.connect(self.image_view.set_highlight)
         self.chk_processed.toggled.connect(lambda _: self._show_frame(self.timeline.current()))
         self.chk_overlay.toggled.connect(self._on_overlay_toggle)
         self.chk_load_rot.toggled.connect(self._on_load_rot_toggle)
         self.chk_view_rot.toggled.connect(self._on_view_rot_toggle)
+        self.chk_hud.toggled.connect(self.image_view.set_hud_visible)
         if self.settings.view_rot180:
             self.image_view.set_view_rot180(True)
 
@@ -367,6 +391,11 @@ class MainWindow(QMainWindow):
         m_link = self.menuBar().addMenu("连接(&L)")
         self._add_action(m_link, "串口图传...", None, self._open_serial_dialog)
         self._add_action(m_link, "蓝牙图传（SPP，同串口）...", None, self._open_serial_dialog)
+
+        m_ui = self.menuBar().addMenu("界面(&V)")
+        self._add_action(m_ui, "选择壁纸...", None, self._pick_wallpaper)
+        self._add_action(m_ui, "壁纸暗度...", None, self._adjust_wallpaper_dim)
+        self._add_action(m_ui, "清除壁纸", None, self._clear_wallpaper)
 
         m_help = self.menuBar().addMenu("帮助(&H)")
         self._add_action(m_help, "API 速查（画线/日志/移植）", "F1", self._show_api_help)
@@ -454,6 +483,7 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         self.run_result = None
         self._record_params = []
         self.watch_panel.clear()
+        self.rec_panel.clear()
         self.tag_panel.clear()
         self.trace_panel.clear()
         self.timeline.set_range(fs.count)
@@ -505,6 +535,32 @@ void image_process(uint8_t img[IMG_H][IMG_W])
             "timeout": self.settings.timeout_base,
         })
 
+    # ---- 单变量曲线窗口 ----
+    def _open_var_plot(self, name: str, values) -> None:
+        """双击监视/车端记录里的变量 -> 独立曲线窗口（同名复用，多变量可并开）。"""
+        dlg = self._var_plots.get(name)
+        if dlg is None:
+            dlg = VarPlotDialog(name, list(values), self)
+            dlg.frame_selected.connect(self.timeline.goto)
+            dlg.finished.connect(lambda _=0, n=name: self._var_plots.pop(n, None))
+            self._var_plots[name] = dlg
+        else:
+            dlg.set_values(list(values))
+        dlg.set_current_frame(self.timeline.current())
+        dlg.show()
+        dlg.raise_()
+        dlg.activateWindow()
+
+    def _refresh_var_plots(self) -> None:
+        """重跑/换数据后刷新已打开的曲线窗口；变量消失的窗口留着不动。"""
+        for name, dlg in list(self._var_plots.items()):
+            vals = self.watch_panel.values_of(name)
+            if vals is None:
+                vals = self.rec_panel.values_of(name)
+            if vals is not None:
+                dlg.set_values(vals)
+            dlg.set_current_frame(self.timeline.current())
+
     # ---- 数据记录方案 ----
     def _open_record_dialog(self) -> None:
         if self._record_dialog is None:
@@ -525,15 +581,15 @@ void image_process(uint8_t img[IMG_H][IMG_W])
             n = len(params[0][1]) if params else 0
         if not params or n == 0:
             return
-        # 车端记录的参数 → 监视面板（与 sim_plot 同一显示通道）；
-        # 保存下来，之后每次 F5 都并进运行结果，可与算法输出对比
+        # 车端记录的参数 → 独立「车端记录」面板（与 sim_plot 的「监视」分开显示）
         self._record_params = [(name, [float(v) for v in col]) for name, col in params]
         frames = [
             FrameResult(index=i, watches={name: col[i] for name, col in self._record_params})
             for i in range(n)
         ]
-        self.watch_panel.set_run(frames)
-        self.watch_panel.set_current_frame(self.timeline.current())
+        self.rec_panel.set_run(frames)
+        self.rec_panel.set_current_frame(self.timeline.current())
+        self._refresh_var_plots()
 
     # ---- SD 卡原始数据 ----
     def _open_sd_raw(self) -> None:
@@ -587,6 +643,50 @@ void image_process(uint8_t img[IMG_H][IMG_W])
     def _reveal_workspace(self) -> None:
         target = self.current_file.parent if self.current_file else Path(self.settings.last_workspace or Path.home())
         QDesktopServices.openUrl(QUrl.fromLocalFile(str(target)))
+
+    # ---- 界面壁纸 ----
+    # 有壁纸时这些容器透明化让底图透出；WebEngine(编辑器/终端)不透明是平台限制
+    _WALL_ON_QSS = """
+        QSplitter, QTabWidget::pane, QTabWidget > QWidget { background: transparent; }
+        QTabBar::tab { background: rgba(30,30,30,180); color:#d4d4d4; padding:4px 12px; }
+        QTabBar::tab:selected { background: rgba(45,45,45,210); }
+        QTextBrowser { background: rgba(30,30,30,165); }
+        Timeline, WatchPanel, TagPanel, TracePanel { background: transparent; }
+    """
+
+    def _apply_wallpaper(self, init: bool = False) -> None:
+        path = self.settings.wallpaper_path
+        ok = self.wall.set_wallpaper(path or None)
+        self.wall.set_dim(self.settings.wallpaper_dim)
+        self.wall.setStyleSheet(self._WALL_ON_QSS if ok else "")
+        self.console.set_translucent(ok)
+        if not ok and path and not init:
+            QMessageBox.warning(self, "壁纸", f"图片加载失败：{path}")
+
+    def _pick_wallpaper(self) -> None:
+        start = str(Path(self.settings.wallpaper_path).parent) if self.settings.wallpaper_path else str(Path.home())
+        fn, _ = QFileDialog.getOpenFileName(
+            self, "选择壁纸图片", start, "图片 (*.jpg *.jpeg *.png *.bmp *.webp);;所有文件 (*)"
+        )
+        if not fn:
+            return
+        self.settings.wallpaper_path = fn
+        self._apply_wallpaper()
+        self.statusBar().showMessage(f"壁纸已设置：{Path(fn).name}（编辑器/终端为浏览器内核，不透壁纸）")
+
+    def _adjust_wallpaper_dim(self) -> None:
+        val, ok = QInputDialog.getInt(
+            self, "壁纸暗度", "遮罩深浅（0=原图，90=最暗，文字更清晰）：",
+            self.settings.wallpaper_dim, 0, 90, 5,
+        )
+        if ok:
+            self.settings.wallpaper_dim = val
+            self.wall.set_dim(val)
+
+    def _clear_wallpaper(self) -> None:
+        self.settings.wallpaper_path = ""
+        self._apply_wallpaper()
+        self.statusBar().showMessage("壁纸已清除")
 
     # ---- 帮助 ----
     def _show_api_help(self) -> None:
@@ -737,16 +837,11 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         if rr is None:
             return
         self.run_result = rr
-        # 车端记录的参数并入本轮运行的监视（rec.前缀防与 sim_plot 重名），跨帧对比车/仿真行为
-        if self._record_params:
-            for fr in rr.frames:
-                i = fr.index
-                for name, col in self._record_params:
-                    if 0 <= i < len(col):
-                        fr.watches.setdefault(f"rec.{name}", col[i])
+        # 车端记录参数在独立「车端记录」面板常驻显示，F5 不清、不与 sim_plot 混流
         self.watch_panel.set_run(rr.frames)
         self.tag_panel.set_run(rr.frames)
         self.trace_panel.set_run(rr.frames)
+        self._refresh_var_plots()
         if rr.crashed:
             where = f"第 {rr.crash_frame} 帧" if rr.crash_frame >= 0 else "启动时"
             self.console.append_error(f"运行崩溃（{where}）：{rr.error_msg}")
@@ -782,8 +877,11 @@ void image_process(uint8_t img[IMG_H][IMG_W])
             fr = rr.frames[idx]
         self.image_view.show_frame(base, fr)
         self.watch_panel.set_current_frame(idx)
+        self.rec_panel.set_current_frame(idx)
         self.tag_panel.set_current_frame(idx)
         self.trace_panel.set_current_frame(idx)
+        for dlg in self._var_plots.values():
+            dlg.set_current_frame(idx)
 
     def _on_overlay_toggle(self, on: bool) -> None:
         self.image_view.set_overlay_visible(on)
@@ -893,11 +991,18 @@ _API_HELP_TEXT = """\
   sim_draw_circle(cx, cy, r, SIM_CYAN);     空心圆（环岛拟合）
   sim_draw_cross(x, y, size, SIM_ORANGE);   十字标记（角点/拐点）
   sim_draw_text(x, y, SIM_YELLOW, "th=%d", th);  文字标注（printf风格）
+                                   图上锚点显示（粗体+黑描边）；同时汇总到图像
+                                   左上角**状态板**（大字黑底，缩放/旋转下恒定醒目），
+                                   看"长直/短直/十字"这类状态标签用它最清楚。
+                                   状态板可用图像区上方"状态板"开关关闭。
 
 【日志与监视】
   sim_log("otsu = %d", th);        打印到底部控制台，自动带[帧号]前缀
-  sim_plot("error", err);          记录数值→图像下方监视面板（每变量一行：
-                                   当前帧值+跨帧曲线；点击曲线跳帧，悬停看值）
+  sim_plot("error", err);          记录数值→图像下方监视面板（多列紧凑排列，
+                                   每个变量只显示名称和当前帧值）
+                                   **双击变量**→单独开一个大曲线窗口，可手动设
+                                   Y 轴上下限放大局部幅度（自动量程会压平小波动），
+                                   支持"按数据适配"/"零对称"，曲线内点击/拖动跳帧
   sim_tag(x, y, "L角点 t=%d", t);  给图上某位置附加说明（不画到图上）：
                                    鼠标悬停该处弹出查看；图像下方"本帧标注"
                                    列表逐条列出，点击行图上高亮该点。

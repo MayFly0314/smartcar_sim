@@ -1,7 +1,7 @@
 """数据记录方案设计器：左边"填空"拼帧布局，右边实时生成车端 C 代码。
 
 流程：设计布局（帧头/参数/图像压缩）→ 复制生成的函数到 image_record.c →
-车上录卡 → 回来用同一方案打开记录文件 → 图像进时间轴、参数进监视面板。
+车上录卡 → 回来用同一方案打开记录文件 → 图像进时间轴、参数进车端记录面板。
 方案自动保存（QSettings），下次打开就是上次的布局。
 """
 from __future__ import annotations
@@ -274,4 +274,4 @@ class RecordDialog(QDialog):
         label = f"记录 {Path(fn).name} · {n} 帧{note}"
         params = [(p.name, cols[i]) for i, p in enumerate(s.params)]
         self.record_loaded.emit(fs, label, params)
-        self._lbl_status.setText(f"已加载 {n} 帧{note}——参数见主窗口监视面板")
+        self._lbl_status.setText(f"已加载 {n} 帧{note}——参数见主窗口车端记录面板")
