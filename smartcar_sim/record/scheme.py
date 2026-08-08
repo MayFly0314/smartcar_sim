@@ -46,6 +46,15 @@ class ParamField:
 
 
 @dataclass
+class LineField:
+    """一条边界线：按图像行保存 x 坐标，负数表示该行无效。"""
+
+    name: str
+    ctype: str = "int16"
+    expr: str = ""
+
+
+@dataclass
 class RecordScheme:
     magic_hex: str = "AA 55"
     params: list[ParamField] = field(default_factory=list)
@@ -54,6 +63,7 @@ class RecordScheme:
     img_w: int = 186
     img_h: int = 70
     func_name: str = "sd_record_frame_c"
+    line_fields: list[LineField] = field(default_factory=list)
 
     # ---- 布局 ----
     def magic(self) -> bytes:
@@ -61,6 +71,9 @@ class RecordScheme:
 
     def params_bytes(self) -> int:
         return sum(CTYPES[p.ctype][1] for p in self.params)
+
+    def line_bytes(self) -> int:
+        return sum(CTYPES[p.ctype][1] * self.img_h for p in self.line_fields)
 
     def image_bytes(self) -> int:
         per = self.img_w * self.img_h
@@ -71,7 +84,7 @@ class RecordScheme:
         return 0
 
     def payload_bytes(self) -> int:
-        return len(self.magic()) + self.params_bytes() + self.image_bytes()
+        return len(self.magic()) + self.params_bytes() + self.line_bytes() + self.image_bytes()
 
     def sectors_per_frame(self) -> int:
         return max(1, (self.payload_bytes() + _SECTOR - 1) // _SECTOR)
@@ -80,9 +93,11 @@ class RecordScheme:
         return self.sectors_per_frame() * _SECTOR
 
     def layout_summary(self) -> str:
-        m, pb, ib = len(self.magic()), self.params_bytes(), self.image_bytes()
+        m, pb, lb, ib = (
+            len(self.magic()), self.params_bytes(), self.line_bytes(), self.image_bytes()
+        )
         return (
-            f"帧头 {m}B + 参数 {pb}B + 图像 {ib}B = {self.payload_bytes()}B "
+            f"帧头 {m}B + 参数 {pb}B + 三线 {lb}B + 图像 {ib}B = {self.payload_bytes()}B "
             f"→ 每帧 {self.sectors_per_frame()} 扇区（{self.stride()}B，含补零）"
         )
 
@@ -94,6 +109,10 @@ class RecordScheme:
     def from_json(cls, text: str) -> "RecordScheme":
         d = json.loads(text)
         d["params"] = [ParamField(**p) for p in d.get("params", [])]
+        if "line_fields" in d:
+            d["line_fields"] = [LineField(**p) for p in d.get("line_fields", [])]
+        else:
+            d["line_fields"] = default_line_fields(int(d.get("img_h", 70)))
         return cls(**d)
 
     # ---- 解码 ----
@@ -117,7 +136,14 @@ class RecordScheme:
     def decode(
         self, data: np.ndarray, skip: int = 0
     ) -> tuple[FrameSet | None, list[np.ndarray], int]:
-        """按方案切帧。返回 (帧集|None, 与 params 对齐的逐帧值数组列表, 帧数)。"""
+        """兼容接口：返回 (帧集|None, 参数数组, 帧数)。"""
+        fs, cols, n, _lines = self.decode_with_lines(data, skip)
+        return fs, cols, n
+
+    def decode_with_lines(
+        self, data: np.ndarray, skip: int = 0
+    ) -> tuple[FrameSet | None, list[np.ndarray], int, list[np.ndarray]]:
+        """按方案切帧，并额外返回与 line_fields 对齐的三线数组。"""
         if skip > 0:
             data = data[skip:]
         stride = self.stride()
@@ -142,17 +168,27 @@ class RecordScheme:
             cols.append(np.frombuffer(seg.tobytes(), dtype="<" + npdt).copy())
             off += size
 
+        line_cols: list[np.ndarray] = []
+        for line in self.line_fields:
+            _fmt, size, npdt, _c = CTYPES[line.ctype]
+            total = size * self.img_h
+            seg = np.ascontiguousarray(blob[:, off:off + total]).reshape(n, self.img_h, size)
+            line_cols.append(
+                np.frombuffer(seg.tobytes(), dtype="<" + npdt).copy().reshape(n, self.img_h)
+            )
+            off += total
+
         per = self.img_w * self.img_h
         ib = self.image_bytes()
         if self.image_mode == "none":
-            return None, cols, n
+            return None, cols, n, line_cols
         img_seg = np.ascontiguousarray(blob[:, off:off + ib])
         if self.image_mode == "packed1":
             bits = np.unpackbits(img_seg, axis=1)[:, :per]  # MSB 在前，与 C 端一致
             frames = (bits.reshape(n, self.img_h, self.img_w) * 255).astype(np.uint8)
         else:  # raw8
             frames = img_seg.reshape(n, self.img_h, self.img_w).copy()
-        return FrameSet(frames=np.ascontiguousarray(frames), paths=[]), cols, n
+        return FrameSet(frames=np.ascontiguousarray(frames), paths=[]), cols, n, line_cols
 
     # ---- C 代码生成 ----
     def generate_c(self) -> str:
@@ -196,6 +232,11 @@ class RecordScheme:
             _fmt, size, _np, cname = CTYPES[p.ctype]
             a(f"    {{ {cname} v = ({cname})({p.expr}); "
               f"memcpy(p, &v, {size}); p += {size}; }}  /* {p.name} */")
+        for line in self.line_fields:
+            _fmt, size, _np, cname = CTYPES[line.ctype]
+            a(f"    /* {line.name}: 每行一个 x 坐标，负数表示无效 */")
+            a(f"    for (uint32 i = 0; i < IMG_H; ++i) {{ {cname} v = ({cname})({line.expr}[i]); "
+              f"memcpy(p, &v, {size}); p += {size}; }}")
         if self.image_mode == "packed1":
             a(f"    rec_pack_1bpp({self.image_expr}, p);            "
               f"/* 图像压缩 {self.image_bytes()}B */")
@@ -211,6 +252,16 @@ class RecordScheme:
         return "\n".join(lines) + "\n"
 
 
+def default_line_fields(img_h: int) -> list[LineField]:
+    """默认三线：左边界 / 中线 / 右边界，数组长度为 IMG_H。"""
+    _ = img_h
+    return [
+        LineField("左边界", "int16", "left_boundary"),
+        LineField("中线", "int16", "center_line"),
+        LineField("右边界", "int16", "right_boundary"),
+    ]
+
+
 def default_scheme(img_w: int, img_h: int) -> RecordScheme:
     """默认方案：贴合本项目车端现状（binary_image + servo/error 两参数示例）。"""
     return RecordScheme(
@@ -223,4 +274,5 @@ def default_scheme(img_w: int, img_h: int) -> RecordScheme:
         image_expr="binary_image",
         img_w=img_w,
         img_h=img_h,
+        line_fields=default_line_fields(img_h),
     )

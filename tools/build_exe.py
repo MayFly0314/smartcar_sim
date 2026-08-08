@@ -38,7 +38,8 @@ def main() -> int:
     exe = ROOT / "dist" / "SmartcarSim" / "SmartcarSim.exe"
     if exe.exists():
         size = sum(f.stat().st_size for f in (ROOT / "dist" / "SmartcarSim").rglob("*")) / 1e6
-        print(f"\n完成 ✓  {exe}")
+        # Keep the completion message ASCII-safe for GBK Windows consoles.
+        print(f"\n完成 [OK]  {exe}")
         print(f"整个 dist/SmartcarSim/ 文件夹约 {size:.0f} MB，拷到别的机器可直接双击运行")
         return 0
     print("打包结束但未找到 exe")

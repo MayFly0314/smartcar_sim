@@ -21,12 +21,13 @@ _MISSING = QColor("#808080")
 _DIVIDER = QColor("#383838")
 _HOVER_BG = QColor("#2a2d2e")
 
-_HEADER_H = 20
-_ROW_H = 24
+_HEADER_H = 24
+_ROW_H = 28
 _CELL_MIN_W = 150
 _VALUE_W = 72
 _MARGIN = 6
 _MAX_VISIBLE_ROWS = 6
+MAX_WATCHES = 50
 
 
 @dataclass
@@ -51,12 +52,14 @@ def _finite(v: float | None) -> bool:
     return v is not None and math.isfinite(v)
 
 
-def aggregate_watches(frames: list[FrameResult]) -> WatchData:
-    """per-frame watches -> per-variable 跨帧序列。变量按首次出现顺序。"""
+def aggregate_watches(frames: list[FrameResult], limit: int = MAX_WATCHES) -> WatchData:
+    """per-frame watches -> per-variable 跨帧序列，最多保留前 ``limit`` 项。"""
     n = len(frames)
     acc: dict[str, list[float | None]] = {}
     for i, fr in enumerate(frames):
         for name, val in fr.watches.items():
+            if name not in acc and len(acc) >= limit:
+                continue
             col = acc.get(name)
             if col is None:
                 col = [None] * n
@@ -90,14 +93,26 @@ class _WatchArea(QWidget):
     var_activated = Signal(str)   # 双击变量项 -> 变量名
     layout_rows_changed = Signal(int)
 
-    def __init__(self, parent=None):
+    def __init__(
+        self,
+        parent=None,
+        *,
+        row_height: int = _ROW_H,
+        cell_min_width: int = _CELL_MIN_W,
+        font_size: int = 9,
+    ):
         super().__init__(parent)
         self._data = WatchData()
         self._cur = 0
         self._hover = -1
         self._layout_rows = -1
         self.setMouseTracking(True)
-        self._font = QFont("Consolas", 9)
+        self._row_height = max(18, int(row_height))
+        self._cell_min_width = max(80, int(cell_min_width))
+        self._font = QFont("Microsoft YaHei UI", max(8, int(font_size)))
+        self._font.setBold(True)
+        self._name_color = QColor(_NAME)
+        self._value_color = QColor(_VALUE)
 
     # ---- 数据 ----
     def set_data(self, data: WatchData) -> None:
@@ -113,11 +128,11 @@ class _WatchArea(QWidget):
         self.update()
 
     def sizeHint(self):  # noqa: N802
-        return QSize(_CELL_MIN_W * 3, self._row_count() * _ROW_H)
+        return QSize(self._cell_min_width * 3, self._row_count() * self._row_height)
 
     # ---- 几何 ----
     def _column_count(self) -> int:
-        return _grid_columns(max(1, self.width()))
+        return max(1, int(max(1, self.width()) // self._cell_min_width))
 
     def _row_count(self) -> int:
         n = len(self._data.tracks)
@@ -126,7 +141,7 @@ class _WatchArea(QWidget):
 
     def _sync_layout_height(self) -> None:
         rows = self._row_count()
-        height = rows * _ROW_H
+        height = rows * self._row_height
         if self.minimumHeight() != height:
             self.setMinimumHeight(height)
         if rows != self._layout_rows:
@@ -137,7 +152,7 @@ class _WatchArea(QWidget):
         cols = self._column_count()
         cell_w = self.width() / cols
         row, col = divmod(idx, cols)
-        return QRectF(col * cell_w, row * _ROW_H, cell_w, _ROW_H)
+        return QRectF(col * cell_w, row * self._row_height, cell_w, self._row_height)
 
     def _index_at(self, pos) -> int:
         if pos.x() < 0 or pos.y() < 0 or pos.x() >= self.width():
@@ -145,13 +160,33 @@ class _WatchArea(QWidget):
         cols = self._column_count()
         cell_w = self.width() / cols
         col = min(cols - 1, int(pos.x() // cell_w))
-        row = int(pos.y() // _ROW_H)
+        row = int(pos.y() // self._row_height)
         idx = row * cols + col
         return idx if 0 <= idx < len(self._data.tracks) else -1
 
     def resizeEvent(self, ev) -> None:  # noqa: N802
         super().resizeEvent(ev)
         self._sync_layout_height()
+
+    def set_appearance(
+        self,
+        *,
+        name_color: QColor | str | None = None,
+        value_color: QColor | str | None = None,
+        font_size: int | None = None,
+        bold: bool | None = None,
+    ) -> None:
+        if name_color is not None:
+            self._name_color = QColor(name_color)
+        if value_color is not None:
+            self._value_color = QColor(value_color)
+        if font_size is not None:
+            self._font.setPointSize(max(8, int(font_size)))
+        if bold is not None:
+            self._font.setBold(bool(bold))
+        self._sync_layout_height()
+        self.updateGeometry()
+        self.update()
 
     # ---- 绘制 ----
     def paintEvent(self, ev) -> None:  # noqa: N802
@@ -178,12 +213,12 @@ class _WatchArea(QWidget):
                 Qt.TextElideMode.ElideRight,
                 max(0, int(name_rect.width())),
             )
-            p.setPen(_NAME)
+            p.setPen(self._name_color)
             p.drawText(name_rect,
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
                        name)
             cur_v = t.values[self._cur] if self._cur < len(t.values) else None
-            p.setPen(_VALUE if _finite(cur_v) else _MISSING)
+            p.setPen(self._value_color if _finite(cur_v) else _MISSING)
             p.drawText(value_rect,
                        Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignRight,
                        _fmt(cur_v))
@@ -238,7 +273,8 @@ class _Header(QWidget):
         self._count: int | None = None
         self.setFixedHeight(_HEADER_H)
         self.setCursor(Qt.CursorShape.PointingHandCursor)
-        self._font = QFont("Consolas", 9)
+        self._font = QFont("Microsoft YaHei UI", 9)
+        self._font.setBold(True)
 
     def set_count(self, n: int | None) -> None:
         self._count = n
@@ -266,10 +302,27 @@ class _Header(QWidget):
 class WatchPanel(QWidget):
     var_activated = Signal(str, object)   # 双击 -> (变量名, 跨帧值列表)
 
-    def __init__(self, parent=None, title: str = "监视"):
+    def __init__(
+        self,
+        parent=None,
+        title: str = "监视",
+        *,
+        max_tracks: int = MAX_WATCHES,
+        row_height: int = _ROW_H,
+        cell_min_width: int = _CELL_MIN_W,
+        font_size: int = 9,
+        max_visible_rows: int = _MAX_VISIBLE_ROWS,
+    ):
         super().__init__(parent)
+        self._max_tracks = max(1, min(MAX_WATCHES, int(max_tracks)))
+        self._row_height = max(18, int(row_height))
+        self._max_visible_rows = max(1, int(max_visible_rows))
         self._header = _Header(title)
-        self._area = _WatchArea()
+        self._area = _WatchArea(
+            row_height=self._row_height,
+            cell_min_width=cell_min_width,
+            font_size=font_size,
+        )
         self._scroll = QScrollArea()
         self._scroll.setWidget(self._area)
         self._scroll.setWidgetResizable(True)
@@ -301,9 +354,12 @@ class WatchPanel(QWidget):
                 return list(t.values)
         return None
 
+    def has_data(self) -> bool:
+        return not self._area._data.empty
+
     # ---- 对外 API ----
     def set_run(self, frames: list[FrameResult]) -> None:
-        data = aggregate_watches(frames)
+        data = aggregate_watches(frames, self._max_tracks)
         if data.empty:
             self.clear()
             return
@@ -321,9 +377,28 @@ class WatchPanel(QWidget):
         self._header.set_count(None)
         self.setVisible(False)
 
+    def set_appearance(
+        self,
+        *,
+        name_color: QColor | str | None = None,
+        value_color: QColor | str | None = None,
+        font_size: int | None = None,
+        bold: bool | None = None,
+    ) -> None:
+        """调整参数名称/数值颜色和字号，中文名称使用系统中文字体绘制。"""
+        self._area.set_appearance(
+            name_color=name_color,
+            value_color=value_color,
+            font_size=font_size,
+            bold=bold,
+        )
+        if font_size is not None:
+            self._header._font.setPointSize(max(8, int(font_size)))
+            self._header.update()
+
     def _update_scroll_height(self, rows: int) -> None:
-        visible_rows = min(max(0, rows), _MAX_VISIBLE_ROWS)
-        self._scroll.setFixedHeight(visible_rows * _ROW_H)
+        visible_rows = min(max(0, rows), self._max_visible_rows)
+        self._scroll.setFixedHeight(visible_rows * self._row_height)
 
     def _on_toggle(self) -> None:
         self._scroll.setVisible(not self._header.collapsed)

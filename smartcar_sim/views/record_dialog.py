@@ -32,15 +32,23 @@ from PySide6.QtWidgets import (
     QWidget,
 )
 
-from ..record.scheme import CTYPES, IMAGE_MODES, ParamField, RecordScheme, default_scheme
+from ..record.scheme import (
+    CTYPES,
+    IMAGE_MODES,
+    LineField,
+    ParamField,
+    RecordScheme,
+    default_line_fields,
+    default_scheme,
+)
 from ..settings import Settings
 
 _MONO = "font-family:Consolas,monospace;"
 
 
 class RecordDialog(QDialog):
-    # (FrameSet|None, 标签, [(参数名, 逐帧值数组)])
-    record_loaded = Signal(object, str, object)
+    # (FrameSet|None, 标签, [(参数名, 逐帧值数组)], [(线名, 每帧数组)])
+    record_loaded = Signal(object, str, object, object)
 
     def __init__(self, settings: Settings, parent=None) -> None:
         super().__init__(parent)
@@ -121,6 +129,18 @@ class RecordDialog(QDialog):
         pl.addLayout(btns)
         llay.addWidget(gb_par, 1)
 
+        gb_lines = QGroupBox("三条边界数组（每帧各保存 IMG_H 个 x 坐标，负数=无效）")
+        bl = QVBoxLayout(gb_lines)
+        self._line_table = QTableWidget(3, 3)
+        self._line_table.setHorizontalHeaderLabels(["显示名称", "类型", "车端数组表达式"])
+        self._line_table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
+        self._line_table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
+        self._line_table.verticalHeader().setVisible(False)
+        self._line_table.setMaximumHeight(125)
+        self._line_table.setStyleSheet(f"QTableWidget {{ {_MONO} }}")
+        bl.addWidget(self._line_table)
+        llay.addWidget(gb_lines)
+
         self._lbl_layout = QLabel()
         self._lbl_layout.setStyleSheet(f"color:#4ec9b0; {_MONO}")
         self._lbl_layout.setWordWrap(True)
@@ -169,6 +189,7 @@ class RecordDialog(QDialog):
         self._spin_h.valueChanged.connect(self._refresh)
         self._edit_fn.textChanged.connect(self._refresh)
         self._table.cellChanged.connect(lambda *_: self._refresh())
+        self._line_table.cellChanged.connect(lambda *_: self._refresh())
 
     def _load_scheme_to_ui(self) -> None:
         s = self._scheme
@@ -182,6 +203,9 @@ class RecordDialog(QDialog):
         self._edit_fn.setText(s.func_name)
         for p in s.params:
             self._append_row(p)
+        fields = s.line_fields or default_line_fields(s.img_h)
+        for r, line in enumerate(fields[:3]):
+            self._set_line_row(r, line)
 
     def _append_row(self, p: ParamField) -> None:
         r = self._table.rowCount()
@@ -204,6 +228,17 @@ class RecordDialog(QDialog):
             self._table.removeRow(r)
             self._refresh()
 
+    def _set_line_row(self, row: int, line: LineField) -> None:
+        if row >= self._line_table.rowCount():
+            return
+        self._line_table.setItem(row, 0, QTableWidgetItem(line.name))
+        combo = QComboBox()
+        combo.addItems(["int16", "int32"])
+        combo.setCurrentText(line.ctype if line.ctype in ("int16", "int32") else "int16")
+        combo.currentIndexChanged.connect(lambda *_: self._refresh())
+        self._line_table.setCellWidget(row, 1, combo)
+        self._line_table.setItem(row, 2, QTableWidgetItem(line.expr))
+
     # ---- 方案同步 ----
     def _collect(self) -> RecordScheme | None:
         params: list[ParamField] = []
@@ -224,6 +259,17 @@ class RecordDialog(QDialog):
                 img_w=self._spin_w.value(),
                 img_h=self._spin_h.value(),
                 func_name=self._edit_fn.text().strip() or "sd_record_frame_c",
+                line_fields=[
+                    LineField(
+                        (self._line_table.item(r, 0).text().strip()
+                         if self._line_table.item(r, 0) else "") or f"边界{r + 1}",
+                        (self._line_table.cellWidget(r, 1).currentText()
+                         if isinstance(self._line_table.cellWidget(r, 1), QComboBox) else "int16"),
+                        (self._line_table.item(r, 2).text().strip()
+                         if self._line_table.item(r, 2) else "") or f"boundary_{r}[i]",
+                    )
+                    for r in range(self._line_table.rowCount())
+                ],
             )
             s.magic()  # 触发 hex 校验
             return s
@@ -265,13 +311,20 @@ class RecordDialog(QDialog):
                         "找不到帧头——检查方案的帧头/布局是否与录制时一致，或导出起点是否正确"
                     )
                 skip = found
-            fs, cols, n = s.decode(data, skip=skip)
+            fs, cols, n, line_cols = s.decode_with_lines(data, skip=skip)
         except Exception as e:  # noqa: BLE001
             QMessageBox.warning(self, "解析失败", str(e))
             return
         self.settings.last_sd_raw = fn
+        self.settings.img_w = s.img_w
+        self.settings.img_h = s.img_h
         note = f"（自动对齐：跳过前 {skip} 字节）" if skip else ""
         label = f"记录 {Path(fn).name} · {n} 帧{note}"
         params = [(p.name, cols[i]) for i, p in enumerate(s.params)]
-        self.record_loaded.emit(fs, label, params)
+        lines = [
+            (line.name, line_cols[i])
+            for i, line in enumerate(s.line_fields)
+            if i < len(line_cols)
+        ]
+        self.record_loaded.emit(fs, label, params, lines)
         self._lbl_status.setText(f"已加载 {n} 帧{note}——参数见主窗口车端记录面板")

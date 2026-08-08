@@ -30,6 +30,7 @@ from PySide6.QtWidgets import (
     QPlainTextEdit,
     QPushButton,
     QSpinBox,
+    QStackedWidget,
     QSplitter,
     QTabWidget,
     QVBoxLayout,
@@ -48,6 +49,7 @@ from .run.runner import run_sim
 from .settings import Settings
 from .views.console import Console
 from .views.image_view import ImageView
+from .views.parameter_dashboard import ParameterDashboard
 from .views.record_dialog import RecordDialog
 from .views.serial_dialog import SerialDialog
 from .views.tag_panel import TagPanel
@@ -248,6 +250,7 @@ class MainWindow(QMainWindow):
         self._online_base = None          # 在线帧底图（结果回来时叠加用）
         self._frames_are_local = False    # 当前帧来自本地图像文件（载入翻转仅对其生效）
         self._record_params: list[tuple[str, list[float]]] = []  # 车端记录面板的参数
+        self._record_lines: list[tuple[str, object]] = []        # SD 记录的三条边界数组
         self._serial_dialog: SerialDialog | None = None
         self._record_dialog: RecordDialog | None = None
         self._var_plots: dict[str, VarPlotDialog] = {}   # 变量名 -> 独立曲线窗口
@@ -271,6 +274,7 @@ class MainWindow(QMainWindow):
         self.terminal = TerminalWidget()
         self.watch_panel = WatchPanel()
         self.rec_panel = WatchPanel(title="车端记录")   # SD 记录的参数，独立于 sim_plot 监视
+        self.parameter_dashboard = ParameterDashboard()
         self.tag_panel = TagPanel()
         self.trace_panel = TracePanel()
 
@@ -319,8 +323,12 @@ class MainWindow(QMainWindow):
         rlay.addWidget(self.trace_panel)
         rlay.addWidget(self.timeline)
 
+        self._left_stack = QStackedWidget()
+        self._left_stack.addWidget(self.editor)
+        self._left_stack.addWidget(self.parameter_dashboard)
+
         h_split = QSplitter(Qt.Orientation.Horizontal)
-        h_split.addWidget(self.editor)
+        h_split.addWidget(self._left_stack)
         h_split.addWidget(right)
         h_split.setSizes([700, 700])
 
@@ -356,6 +364,8 @@ class MainWindow(QMainWindow):
         self.timeline.frame_changed.connect(self._show_frame)
         self.watch_panel.var_activated.connect(self._open_var_plot)
         self.rec_panel.var_activated.connect(self._open_var_plot)
+        self.parameter_dashboard.var_activated.connect(self._open_var_plot)
+        self.parameter_dashboard.appearance_changed.connect(self._set_parameter_appearance)
         self.tag_panel.tag_selected.connect(self.image_view.set_highlight)
         self.chk_processed.toggled.connect(lambda _: self._show_frame(self.timeline.current()))
         self.chk_overlay.toggled.connect(self._on_overlay_toggle)
@@ -393,6 +403,10 @@ class MainWindow(QMainWindow):
         self._add_action(m_link, "蓝牙图传（SPP，同串口）...", None, self._open_serial_dialog)
 
         m_ui = self.menuBar().addMenu("界面(&V)")
+        self._act_editor = self._add_action(m_ui, "显示代码编辑器", None, self._toggle_editor_mode)
+        self._act_editor.setCheckable(True)
+        self._act_editor.setChecked(True)
+        m_ui.addSeparator()
         self._add_action(m_ui, "选择壁纸...", None, self._pick_wallpaper)
         self._add_action(m_ui, "壁纸暗度...", None, self._adjust_wallpaper_dim)
         self._add_action(m_ui, "清除壁纸", None, self._clear_wallpaper)
@@ -408,6 +422,24 @@ class MainWindow(QMainWindow):
         a.triggered.connect(slot)
         menu.addAction(a)
         return a
+
+    def _toggle_editor_mode(self, enabled: bool) -> None:
+        """左侧在代码编辑器与大参数/三线工作区之间切换。"""
+        self._left_stack.setCurrentWidget(self.editor if enabled else self.parameter_dashboard)
+        # 编辑器关闭时，右侧参数移到左侧大面板；标签/流程/时间轴仍留在图像下方。
+        for panel in (self.watch_panel, self.rec_panel):
+            panel.setVisible(bool(enabled) and panel.has_data())
+        self.statusBar().showMessage("代码编辑器已开启" if enabled else "参数与三线工作区已开启")
+
+    def _set_parameter_appearance(self, name_color, value_color, font_size: int, bold: bool) -> None:
+        """把左侧大面板的外观同步给右侧紧凑面板，切回编辑器时仍保持一致。"""
+        for panel in (self.watch_panel, self.rec_panel):
+            panel.set_appearance(
+                name_color=name_color,
+                value_color=value_color,
+                font_size=font_size,
+                bold=bold,
+            )
 
     # ---- 文件操作 ----
     _NEW_TEMPLATE = '''#include "sim_api.h"
@@ -482,8 +514,10 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         self.frameset = fs
         self.run_result = None
         self._record_params = []
+        self._record_lines = []
         self.watch_panel.clear()
         self.rec_panel.clear()
+        self.parameter_dashboard.clear()
         self.tag_panel.clear()
         self.trace_panel.clear()
         self.timeline.set_range(fs.count)
@@ -570,25 +604,47 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         self._record_dialog.raise_()
         self._record_dialog.activateWindow()
 
-    def _on_record_loaded(self, fs, label: str, params) -> None:
+    def _on_record_loaded(self, fs, label: str, params, lines=None) -> None:
         from .run.protocol import FrameResult
 
+        lines = list(lines or [])
         if fs is not None:
             self._frames_are_local = False  # 记录帧已是约定坐标
             self.load_frameset(fs, label)   # 内部会清面板与 _record_params
             n = fs.count
         else:
-            n = len(params[0][1]) if params else 0
+            n = (
+                len(params[0][1]) if params
+                else (len(lines[0][1]) if lines else 0)
+            )
+            self.frameset = None
+            self.run_result = None
+            self._record_params = []
+            self._record_lines = []
+            self.watch_panel.clear()
+            self.rec_panel.clear()
+            self.tag_panel.clear()
+            self.trace_panel.clear()
+            self.parameter_dashboard.clear()
+            self.timeline.set_range(n)
         if not params or n == 0:
-            return
-        # 车端记录的参数 → 独立「车端记录」面板（与 sim_plot 的「监视」分开显示）
-        self._record_params = [(name, [float(v) for v in col]) for name, col in params]
-        frames = [
-            FrameResult(index=i, watches={name: col[i] for name, col in self._record_params})
-            for i in range(n)
-        ]
-        self.rec_panel.set_run(frames)
-        self.rec_panel.set_current_frame(self.timeline.current())
+            frames = []
+        else:
+            # 车端记录的参数 → 独立「车端记录」面板（与 sim_plot 的「监视」分开显示）
+            self._record_params = [(name, [float(v) for v in col]) for name, col in params]
+            frames = [
+                FrameResult(index=i, watches={name: col[i] for name, col in self._record_params})
+                for i in range(n)
+            ]
+            self.rec_panel.set_run(frames)
+            self.parameter_dashboard.set_record_run(frames)
+            self.rec_panel.set_current_frame(self.timeline.current())
+        self._record_lines = lines
+        if lines:
+            width = fs.w if fs is not None else self.settings.img_w
+            height = fs.h if fs is not None else self.settings.img_h
+            self.parameter_dashboard.set_lines(lines, width, height)
+        self.parameter_dashboard.set_current_frame(self.timeline.current())
         self._refresh_var_plots()
 
     # ---- SD 卡原始数据 ----
@@ -839,6 +895,7 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         self.run_result = rr
         # 车端记录参数在独立「车端记录」面板常驻显示，F5 不清、不与 sim_plot 混流
         self.watch_panel.set_run(rr.frames)
+        self.parameter_dashboard.set_monitor_run(rr.frames)
         self.tag_panel.set_run(rr.frames)
         self.trace_panel.set_run(rr.frames)
         self._refresh_var_plots()
@@ -864,6 +921,7 @@ void image_process(uint8_t img[IMG_H][IMG_W])
 
     # ---- 显示 ----
     def _show_frame(self, idx: int) -> None:
+        self.parameter_dashboard.set_current_frame(idx)
         if self.frameset is None or idx < 0 or idx >= self.frameset.count:
             return
         rr = self.run_result
@@ -900,6 +958,7 @@ void image_process(uint8_t img[IMG_H][IMG_W])
             self.frameset = self.frameset.rotated180()
             self.run_result = None
             self.watch_panel.clear()
+            self.parameter_dashboard.clear()
             self.tag_panel.clear()
             self.trace_panel.clear()
             self._show_frame(self.timeline.current())

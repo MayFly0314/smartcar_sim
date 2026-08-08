@@ -8,6 +8,7 @@ import pytest
 
 from smartcar_sim.record.scheme import (
     CTYPES,
+    LineField,
     ParamField,
     RecordScheme,
     default_scheme,
@@ -126,3 +127,36 @@ def test_default_scheme_valid():
     s = default_scheme(186, 70)
     assert s.sectors_per_frame() >= 1
     s.generate_c()  # 不抛即可
+
+
+def test_three_boundary_arrays_roundtrip():
+    s = RecordScheme(
+        magic_hex="AA 55",
+        params=[],
+        image_mode="none",
+        img_w=8,
+        img_h=3,
+        line_fields=[
+            LineField("左边界", "int16", "left_boundary"),
+            LineField("中线", "int16", "center_line"),
+            LineField("右边界", "int16", "right_boundary"),
+        ],
+    )
+    values = [
+        [[1, 2, -1], [3, 4, 5], [6, 7, 8]],
+        [[2, 3, 4], [5, -1, 7], [8, 9, 10]],
+    ]
+    blob = bytearray()
+    for frame in values:
+        row = bytearray(s.magic())
+        for line in frame:
+            for value in line:
+                row += struct.pack("<h", value)
+        row += b"\x00" * (s.stride() - len(row))
+        blob += row
+    fs, cols, n, lines = s.decode_with_lines(np.frombuffer(blob, dtype=np.uint8))
+    assert fs is None and cols == [] and n == 2
+    assert len(lines) == 3
+    assert lines[0].tolist() == [values[0][0], values[1][0]]
+    assert lines[1].tolist() == [values[0][1], values[1][1]]
+    assert lines[2].tolist() == [values[0][2], values[1][2]]
