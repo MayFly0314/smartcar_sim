@@ -172,3 +172,7 @@ class ParameterDashboard(QWidget):
 
     def set_lines(self, lines, width: int, height: int) -> None:
         self.boundary_view.set_lines(lines, width, height)
+
+    def set_view_rot180(self, on: bool) -> None:
+        """Keep the boundary preview oriented like the main image view."""
+        self.boundary_view.set_view_rot180(on)

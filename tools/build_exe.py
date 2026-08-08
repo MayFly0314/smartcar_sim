@@ -22,9 +22,16 @@ def main() -> int:
         print("错误：未安装 PyInstaller，先运行 pip install pyinstaller")
         return 1
 
-    # 清理旧产物
+    # 清理旧产物；程序仍在运行时 DLL 会被锁定，提前给出可读提示。
     for d in ("build", "dist"):
-        shutil.rmtree(ROOT / d, ignore_errors=True)
+        target = ROOT / d
+        if not target.exists():
+            continue
+        try:
+            shutil.rmtree(target)
+        except OSError as e:
+            print(f"错误：无法清理旧产物 {target}，请先关闭正在运行的 SmartcarSim。\n{e}")
+            return 1
 
     print("开始打包（几分钟）...")
     r = subprocess.run(

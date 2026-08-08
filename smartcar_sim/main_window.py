@@ -374,6 +374,7 @@ class MainWindow(QMainWindow):
         self.chk_hud.toggled.connect(self.image_view.set_hud_visible)
         if self.settings.view_rot180:
             self.image_view.set_view_rot180(True)
+            self.parameter_dashboard.set_view_rot180(True)
 
         self._restore_session()
 
@@ -969,6 +970,7 @@ void image_process(uint8_t img[IMG_H][IMG_W])
     def _on_view_rot_toggle(self, on: bool) -> None:
         self.settings.view_rot180 = on
         self.image_view.set_view_rot180(on)
+        self.parameter_dashboard.set_view_rot180(on)
 
     def _on_pixel(self, x: int, y: int, v: int) -> None:
         self.lbl_pixel.setText(f"({x}, {y}) = {v}" if x >= 0 else "")

@@ -22,6 +22,7 @@ class BoundaryView(QWidget):
         self._width = 0
         self._height = 0
         self._frame = 0
+        self._rot180 = False
 
     def set_lines(
         self,
@@ -29,7 +30,7 @@ class BoundaryView(QWidget):
         width: int,
         height: int,
     ) -> None:
-        self._lines = [(str(name), np.asarray(values).reshape(-1)) for name, values in lines[:3]]
+        self._lines = [(str(name), np.asarray(values)) for name, values in lines[:3]]
         self._width = max(0, int(width))
         self._height = max(0, int(height))
         self.update()
@@ -37,6 +38,13 @@ class BoundaryView(QWidget):
     def set_current_frame(self, idx: int) -> None:
         self._frame = max(0, int(idx))
         self.update()
+
+    def set_view_rot180(self, on: bool) -> None:
+        """Match the image view's display-only 180 degree rotation."""
+        on = bool(on)
+        if on != self._rot180:
+            self._rot180 = on
+            self.update()
 
     def clear(self) -> None:
         self._lines = []
@@ -59,13 +67,19 @@ class BoundaryView(QWidget):
 
         p.setRenderHint(QPainter.RenderHint.Antialiasing, True)
         for line_idx, (_name, values) in enumerate(self._lines):
+            if values.ndim == 2:
+                if self._frame >= values.shape[0]:
+                    continue
+                row = values[self._frame]
+            else:
+                row = values
             pen = QPen(self._COLORS[line_idx % len(self._COLORS)])
             pen.setWidthF(max(2.0, min(5.0, 2.2 * scale)))
             pen.setCapStyle(Qt.PenCapStyle.RoundCap)
             pen.setJoinStyle(Qt.PenJoinStyle.RoundJoin)
             p.setPen(pen)
             prev: QPointF | None = None
-            for y, raw_x in enumerate(values[: self._height]):
+            for y, raw_x in enumerate(row[: self._height]):
                 try:
                     x = float(raw_x)
                 except (TypeError, ValueError):
@@ -74,11 +88,18 @@ class BoundaryView(QWidget):
                 if not math.isfinite(x) or x < 0 or x >= self._width:
                     prev = None
                     continue
-                pt = QPointF(ox + (x + 0.5) * scale, oy + (y + 0.5) * scale)
+                if self._rot180:
+                    # Boundary arrays use the same image coordinates as the
+                    # algorithm. Rotate their display to match ImageView.
+                    dx = self._width - x - 0.5
+                    dy = self._height - y - 0.5
+                else:
+                    dx = x + 0.5
+                    dy = y + 0.5
+                pt = QPointF(ox + dx * scale, oy + dy * scale)
                 if prev is not None:
                     p.drawLine(prev, pt)
                 else:
                     p.drawPoint(pt)
                 prev = pt
         p.end()
-

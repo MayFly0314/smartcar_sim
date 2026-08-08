@@ -91,13 +91,14 @@ class ImageView(QGraphicsView):
             ov = render_overlay(frame_result, w, h)
             self._overlay_item.setPixmap(QPixmap.fromImage(ov))
             self._overlay_item.setVisible(True)
-            font = QFont("Consolas", 11)
+            font = QFont("Microsoft YaHei UI", 11)
             font.setBold(True)
             for x, y, rgb, text in text_items(frame_result):
                 it = QGraphicsSimpleTextItem(text)
                 it.setFont(font)
                 it.setBrush(QBrush(QColor((rgb >> 16) & 0xFF, (rgb >> 8) & 0xFF, rgb & 0xFF)))
-                it.setPen(QPen(QColor(0, 0, 0, 220), 2.0))  # 粗黑描边，浅色底图上也看得清
+                # QGraphicsSimpleTextItem 的粗描边会覆盖小字号填充，导致所有颜色看起来都是黑色。
+                it.setPen(QPen(Qt.PenStyle.NoPen))
                 it.setPos(x, y)
                 it.setFlag(it.GraphicsItemFlag.ItemIgnoresTransformations)
                 it.setVisible(not self._hud_on)   # 状态板开着就不在图上重复画一遍
