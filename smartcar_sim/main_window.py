@@ -51,6 +51,7 @@ from .views.console import Console
 from .views.image_view import ImageView
 from .views.parameter_dashboard import ParameterDashboard
 from .views.record_dialog import RecordDialog
+from .views.sdcard_dialog import SdCardDialog
 from .views.serial_dialog import SerialDialog
 from .views.tag_panel import TagPanel
 from .views.terminal import TerminalWidget
@@ -253,6 +254,7 @@ class MainWindow(QMainWindow):
         self._record_lines: list[tuple[str, object]] = []        # SD 记录的三条边界数组
         self._serial_dialog: SerialDialog | None = None
         self._record_dialog: RecordDialog | None = None
+        self._sdcard_dialog: SdCardDialog | None = None
         self._var_plots: dict[str, VarPlotDialog] = {}   # 变量名 -> 独立曲线窗口
 
         # 常驻工作线程
@@ -385,6 +387,7 @@ class MainWindow(QMainWindow):
         self._add_action(m_file, "打开 C 文件...", "Ctrl+O", self._open_c_file)
         self._add_action(m_file, "打开图像...", "Ctrl+I", self._open_image)
         self._add_action(m_file, "打开图像文件夹...", "Ctrl+Shift+I", self._open_image_folder)
+        self._add_action(m_file, "从 SD 卡直接读取录制...", None, self._open_sdcard_dialog)
         self._add_action(m_file, "打开 SD 原始数据(raw)...", None, self._open_sd_raw)
         self._add_action(m_file, "数据记录方案（压缩存图/参数）...", None, self._open_record_dialog)
         m_file.addSeparator()
@@ -596,6 +599,15 @@ void image_process(uint8_t img[IMG_H][IMG_W])
                 dlg.set_values(vals)
             dlg.set_current_frame(self.timeline.current())
 
+    # ---- SD 卡直读 ----
+    def _open_sdcard_dialog(self) -> None:
+        if self._sdcard_dialog is None:
+            self._sdcard_dialog = SdCardDialog(self.settings, self)
+            self._sdcard_dialog.record_loaded.connect(self._on_record_loaded)
+        self._sdcard_dialog.show()
+        self._sdcard_dialog.raise_()
+        self._sdcard_dialog.activateWindow()
+
     # ---- 数据记录方案 ----
     def _open_record_dialog(self) -> None:
         if self._record_dialog is None:
@@ -605,9 +617,29 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         self._record_dialog.raise_()
         self._record_dialog.activateWindow()
 
+    def _record_param_groups(self) -> dict[str, str]:
+        """「参数名 -> 分组名」，供车端记录面板分块显示。
+
+        优先用最近一次载入时随行的布局（_record_scheme_used），
+        否则退回 QSettings 里的当前方案。取不到就不分组，显示照常。
+        """
+        try:
+            from .record.scheme import RecordScheme
+            s = getattr(self, "_record_scheme_used", None)
+            if s is None:
+                saved = self.settings.record_scheme
+                if not saved:
+                    return {}
+                s = RecordScheme.from_json(saved)
+            return {p.name: (p.group or "") for p in s.params if (p.group or "").strip()}
+        except Exception:  # noqa: BLE001
+            return {}
+
     def _on_record_loaded(self, fs, label: str, params, lines=None) -> None:
         from .run.protocol import FrameResult
 
+        # 发信号的那个对话框刚用的方案（可能来自随文件保存的 sidecar）
+        self._record_scheme_used = getattr(self.sender(), "scheme_used", None)
         lines = list(lines or [])
         if fs is not None:
             self._frames_are_local = False  # 记录帧已是约定坐标
@@ -637,7 +669,7 @@ void image_process(uint8_t img[IMG_H][IMG_W])
                 FrameResult(index=i, watches={name: col[i] for name, col in self._record_params})
                 for i in range(n)
             ]
-            self.rec_panel.set_run(frames)
+            self.rec_panel.set_run(frames, self._record_param_groups())
             self.parameter_dashboard.set_record_run(frames)
             self.rec_panel.set_current_frame(self.timeline.current())
         self._record_lines = lines

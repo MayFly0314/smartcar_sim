@@ -109,22 +109,30 @@ class RecordDialog(QDialog):
         hl.addLayout(row3)
         llay.addWidget(gb_head)
 
-        gb_par = QGroupBox("参数（每帧随图像一起记录；名称在回放面板显示，可随时改）")
+        gb_par = QGroupBox("参数（顺序=卡上字节顺序，改顺序会改变布局；分组只影响显示与整理）")
         pl = QVBoxLayout(gb_par)
-        self._table = QTableWidget(0, 3)
-        self._table.setHorizontalHeaderLabels(["名称", "类型", "车端变量/表达式"])
+        self._table = QTableWidget(0, 4)
+        self._table.setHorizontalHeaderLabels(["名称", "类型", "车端变量/表达式", "分组"])
         self._table.horizontalHeader().setSectionResizeMode(0, QHeaderView.ResizeMode.Stretch)
         self._table.horizontalHeader().setSectionResizeMode(2, QHeaderView.ResizeMode.Stretch)
         self._table.verticalHeader().setVisible(False)
+        self._table.setSelectionBehavior(QTableWidget.SelectionBehavior.SelectRows)
         self._table.setStyleSheet(f"QTableWidget {{ {_MONO} }}")
         pl.addWidget(self._table)
         btns = QHBoxLayout()
         b_add = QPushButton("+ 添加参数")
         b_del = QPushButton("− 删除选中")
+        b_up = QPushButton("↑ 上移")
+        b_down = QPushButton("↓ 下移")
+        b_group = QPushButton("按分组整理")
+        b_group.setToolTip("把同组的参数收拢到一起（组的先后顺序按首次出现）——会改变卡上字节顺序")
         b_add.clicked.connect(self._add_param)
         b_del.clicked.connect(self._del_param)
-        btns.addWidget(b_add)
-        btns.addWidget(b_del)
+        b_up.clicked.connect(lambda: self._move_param(-1))
+        b_down.clicked.connect(lambda: self._move_param(1))
+        b_group.clicked.connect(self._sort_by_group)
+        for b in (b_add, b_del, b_up, b_down, b_group):
+            btns.addWidget(b)
         btns.addStretch(1)
         pl.addLayout(btns)
         llay.addWidget(gb_par, 1)
@@ -210,6 +218,9 @@ class RecordDialog(QDialog):
     def _append_row(self, p: ParamField) -> None:
         r = self._table.rowCount()
         self._table.insertRow(r)
+        self._set_row(r, p)
+
+    def _set_row(self, r: int, p: ParamField) -> None:
         self._table.setItem(r, 0, QTableWidgetItem(p.name))
         combo = QComboBox()
         combo.addItems(list(CTYPES.keys()))
@@ -217,9 +228,53 @@ class RecordDialog(QDialog):
         combo.currentIndexChanged.connect(lambda *_: self._refresh())
         self._table.setCellWidget(r, 1, combo)
         self._table.setItem(r, 2, QTableWidgetItem(p.expr))
+        self._table.setItem(r, 3, QTableWidgetItem(p.group))
+
+    def _row_field(self, r: int) -> ParamField:
+        def txt(c: int) -> str:
+            it = self._table.item(r, c)
+            return it.text().strip() if it else ""
+        w = self._table.cellWidget(r, 1)
+        return ParamField(
+            txt(0) or f"param{r}",
+            w.currentText() if isinstance(w, QComboBox) else "int32",
+            txt(2) or txt(0) or f"param{r}",
+            txt(3),
+        )
+
+    def _move_param(self, delta: int) -> None:
+        """上移/下移选中行——直接改变卡上的字节顺序。"""
+        r = self._table.currentRow()
+        t = r + delta
+        if r < 0 or t < 0 or t >= self._table.rowCount():
+            return
+        a, b = self._row_field(r), self._row_field(t)
+        self._set_row(r, b)
+        self._set_row(t, a)
+        self._table.selectRow(t)
+        self._refresh()
+
+    def _sort_by_group(self) -> None:
+        """把同组参数收拢到一起，组序按首次出现；无组的排最后、保持原相对顺序。"""
+        rows = [self._row_field(r) for r in range(self._table.rowCount())]
+        order: list[str] = []
+        for p in rows:
+            g = (p.group or "").strip()
+            if g and g not in order:
+                order.append(g)
+        order.append("")            # 未分组的放最后
+        ranked = sorted(
+            enumerate(rows),
+            key=lambda kv: (order.index((kv[1].group or "").strip())
+                            if (kv[1].group or "").strip() in order else len(order),
+                            kv[0]),
+        )
+        for r, (_i, p) in enumerate(ranked):
+            self._set_row(r, p)
+        self._refresh()
 
     def _add_param(self) -> None:
-        self._append_row(ParamField(f"param{self._table.rowCount()}", "int32", ""))
+        self._append_row(ParamField(f"param{self._table.rowCount()}", "int32", "", ""))
         self._refresh()
 
     def _del_param(self) -> None:
@@ -241,15 +296,7 @@ class RecordDialog(QDialog):
 
     # ---- 方案同步 ----
     def _collect(self) -> RecordScheme | None:
-        params: list[ParamField] = []
-        for r in range(self._table.rowCount()):
-            name_it = self._table.item(r, 0)
-            expr_it = self._table.item(r, 2)
-            combo = self._table.cellWidget(r, 1)
-            name = (name_it.text().strip() if name_it else "") or f"param{r}"
-            ctype = combo.currentText() if isinstance(combo, QComboBox) else "int32"
-            expr = expr_it.text().strip() if expr_it else ""
-            params.append(ParamField(name, ctype, expr or name))
+        params = [self._row_field(r) for r in range(self._table.rowCount())]
         try:
             s = RecordScheme(
                 magic_hex=self._edit_magic.text().strip(),
@@ -302,6 +349,16 @@ class RecordDialog(QDialog):
             return
         try:
             data = np.fromfile(fn, dtype=np.uint8)
+            # 如果旁边有 SD 卡对话框存的 .scheme.json，优先用它——
+            # 那是录这段数据时的布局，比"当前方案"可靠（方案后来可能被改过）
+            side = Path(fn).with_suffix(".scheme.json")
+            used_sidecar = False
+            if side.is_file():
+                try:
+                    s = RecordScheme.from_json(side.read_text(encoding="utf-8"))
+                    used_sidecar = True
+                except Exception:  # noqa: BLE001
+                    s = self._scheme
             skip = 0
             magic = s.magic()
             if magic and bytes(data[: len(magic)]) != magic:
@@ -319,6 +376,7 @@ class RecordDialog(QDialog):
         self.settings.img_w = s.img_w
         self.settings.img_h = s.img_h
         note = f"（自动对齐：跳过前 {skip} 字节）" if skip else ""
+        src = "（用随文件保存的布局）" if used_sidecar else ""
         label = f"记录 {Path(fn).name} · {n} 帧{note}"
         params = [(p.name, cols[i]) for i, p in enumerate(s.params)]
         lines = [
@@ -326,5 +384,6 @@ class RecordDialog(QDialog):
             for i, line in enumerate(s.line_fields)
             if i < len(line_cols)
         ]
+        self.scheme_used = s          # 主窗口据此取分组（可能来自 sidecar）
         self.record_loaded.emit(fs, label, params, lines)
-        self._lbl_status.setText(f"已加载 {n} 帧{note}——参数见主窗口车端记录面板")
+        self._lbl_status.setText(f"已加载 {n} 帧{note}{src}——参数见主窗口车端记录面板")

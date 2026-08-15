@@ -123,6 +123,56 @@ def test_generate_c_contains_layout():
     assert s.func_name + "(void)" in code
 
 
+def test_generated_c_uses_scheme_dims_not_project_macros():
+    """缓冲区按方案算，循环也必须按方案算——否则工程宏更大时会写越界。
+
+    回归：曾用 IMG_H/IMG_W 跑循环但用方案尺寸开缓冲区，
+    方案 186x70 + 工程宏 188x120 会往 2560B 缓冲区写 3550B。
+    """
+    s = _scheme()
+    code = s.generate_c()
+    assert f"#define REC_IMG_W       {s.img_w}" in code
+    assert f"#define REC_IMG_H       {s.img_h}" in code
+    body = code.split("static uint8 rec_c_buf")[1]
+    # 循环边界只能引用 REC_IMG_*，不能出现裸的 IMG_W/IMG_H
+    for bad in ("y < IMG_H", "x < IMG_W", "i < IMG_H"):
+        assert bad not in body, f"生成的循环仍在用工程宏：{bad}"
+    assert "y < REC_IMG_H" in body and "x < REC_IMG_W" in body
+    # 三线循环同样按方案走（_scheme() 没有 line_fields，单独构造一个验证）
+    with_lines = _scheme()
+    with_lines.line_fields = [LineField("左边界", "int16", "left_boundary")]
+    lbody = with_lines.generate_c().split("static uint8 rec_c_buf")[1]
+    assert "i < REC_IMG_H" in lbody
+    assert "i < IMG_H" not in lbody
+    # 编译期断言把不一致挡在车外
+    assert "_Static_assert(IMG_W == REC_IMG_W && IMG_H == REC_IMG_H" in code
+
+
+def test_generated_c_image_param_not_const():
+    """C 里 uint8(*)[N] 不能隐式转成 const uint8(*)[N]（二级指针无此转换）。
+
+    带 const 会让 rec_pack_1bpp(binary_image, p) 报 incompatible pointer type。
+    """
+    code = _scheme().generate_c()
+    assert "const uint8 img" not in code
+    assert "rec_pack_1bpp(uint8 img[REC_IMG_H][REC_IMG_W]" in code
+
+
+def test_padding_and_headroom_reported():
+    """参数会越加越多——余量必须可见，否则跨扇区后写卡变慢且无人察觉。"""
+    s = _scheme()
+    assert s.padding_bytes() == s.stride() - s.payload_bytes()
+    assert s.padding_bytes() > 0
+    assert "余量" in s.layout_summary()
+
+    # 塞满到恰好跨扇区，提示必须变成 0 余量警告
+    big = _scheme()
+    big.params = big.params + [
+        ParamField(f"p{i}", "int32", f"v{i}") for i in range(s.padding_bytes() // 4)
+    ]
+    assert big.padding_bytes() < s.padding_bytes()
+
+
 def test_default_scheme_valid():
     s = default_scheme(186, 70)
     assert s.sectors_per_frame() >= 1
@@ -160,3 +210,43 @@ def test_three_boundary_arrays_roundtrip():
     assert lines[0].tolist() == [values[0][0], values[1][0]]
     assert lines[1].tolist() == [values[0][1], values[1][1]]
     assert lines[2].tolist() == [values[0][2], values[1][2]]
+
+
+def test_param_group_roundtrip_and_backward_compat():
+    """分组只影响显示与整理，不能改变字节布局；老方案（无 group）要能读。"""
+    import json
+
+    s = _scheme()
+    s.params[0].group = "误差"
+    s.params[1].group = "误差"
+    before = s.payload_bytes()
+    s2 = RecordScheme.from_json(s.to_json())
+    assert [p.group for p in s2.params] == ["误差", "误差", ""]
+    assert s2.payload_bytes() == before          # 分组不占字节
+
+    # 老方案 JSON 里没有 group 字段
+    d = json.loads(s.to_json())
+    for p in d["params"]:
+        p.pop("group", None)
+    s3 = RecordScheme.from_json(json.dumps(d, ensure_ascii=False))
+    assert [p.group for p in s3.params] == ["", "", ""]
+    assert s3.payload_bytes() == before
+
+    # 将来多出的未知字段不能让老版本炸
+    d = json.loads(s.to_json())
+    d["params"][0]["future_field"] = 123
+    d["some_new_top_level"] = True
+    s4 = RecordScheme.from_json(json.dumps(d, ensure_ascii=False))
+    assert s4.payload_bytes() == before
+
+
+def test_generated_c_marks_groups_as_comments():
+    s = _scheme()
+    s.params[0].group = "误差"
+    s.params[1].group = "误差"
+    s.params[2].group = "标志"
+    code = s.generate_c()
+    assert "/* ---- 误差 ---- */" in code
+    assert "/* ---- 标志 ---- */" in code
+    # 组标题只是注释，字段顺序与数量不变
+    assert code.count("memcpy(p, &v,") == len(s.params)

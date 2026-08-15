@@ -20,6 +20,7 @@ _VALUE = QColor("#d4d4d4")
 _MISSING = QColor("#808080")
 _DIVIDER = QColor("#383838")
 _HOVER_BG = QColor("#2a2d2e")
+_GROUP = QColor("#4ec9b0")
 
 _HEADER_H = 24
 _ROW_H = 28
@@ -36,6 +37,7 @@ class WatchTrack:
     values: list[float | None]
     vmin: float = 0.0
     vmax: float = 0.0
+    group: str = ""
 
 
 @dataclass
@@ -52,8 +54,15 @@ def _finite(v: float | None) -> bool:
     return v is not None and math.isfinite(v)
 
 
-def aggregate_watches(frames: list[FrameResult], limit: int = MAX_WATCHES) -> WatchData:
-    """per-frame watches -> per-variable 跨帧序列，最多保留前 ``limit`` 项。"""
+def aggregate_watches(
+    frames: list[FrameResult],
+    limit: int = MAX_WATCHES,
+    groups: dict[str, str] | None = None,
+) -> WatchData:
+    """per-frame watches -> per-variable 跨帧序列，最多保留前 ``limit`` 项。
+
+    groups: 变量名 -> 组名。给了就按组分块显示；不给则退化成原来的紧凑网格。
+    """
     n = len(frames)
     acc: dict[str, list[float | None]] = {}
     for i, fr in enumerate(frames):
@@ -69,7 +78,7 @@ def aggregate_watches(frames: list[FrameResult], limit: int = MAX_WATCHES) -> Wa
     tracks = []
     for name, col in acc.items():
         finite = [v for v in col if _finite(v)]
-        t = WatchTrack(name, col)
+        t = WatchTrack(name, col, group=(groups or {}).get(name, ""))
         if finite:
             t.vmin, t.vmax = min(finite), max(finite)
         tracks.append(t)
@@ -106,6 +115,7 @@ class _WatchArea(QWidget):
         self._cur = 0
         self._hover = -1
         self._layout_rows = -1
+        self._headers: list[tuple[int, str]] = []   # [(行号, 组名)]
         self.setMouseTracking(True)
         self._row_height = max(18, int(row_height))
         self._cell_min_width = max(80, int(cell_min_width))
@@ -134,10 +144,39 @@ class _WatchArea(QWidget):
     def _column_count(self) -> int:
         return max(1, int(max(1, self.width()) // self._cell_min_width))
 
-    def _row_count(self) -> int:
-        n = len(self._data.tracks)
+    def _layout(self) -> tuple[list[tuple[int, int, int]], int]:
+        """算出每个变量的 (行, 列, 组标题行标记)，返回 (格子位置, 总行数)。
+
+        没有任何分组时退化成原来的纯网格（组标题不占行），行为完全不变。
+        """
         cols = self._column_count()
-        return (n + cols - 1) // cols
+        tracks = self._data.tracks
+        groups = [t.group or "" for t in tracks]
+        if not any(groups):
+            slots = [(i // cols, i % cols, -1) for i in range(len(tracks))]
+            return slots, (len(tracks) + cols - 1) // cols
+
+        slots: list[tuple[int, int, int]] = []
+        self._headers = []           # [(行号, 组名)]
+        row = 0
+        i = 0
+        while i < len(tracks):
+            g = groups[i]
+            j = i
+            while j < len(tracks) and groups[j] == g:
+                j += 1
+            if g:
+                self._headers.append((row, g))
+                row += 1
+            for k in range(i, j):
+                off = k - i
+                slots.append((row + off // cols, off % cols, -1))
+            row += (j - i + cols - 1) // cols
+            i = j
+        return slots, row
+
+    def _row_count(self) -> int:
+        return self._layout()[1]
 
     def _sync_layout_height(self) -> None:
         rows = self._row_count()
@@ -149,20 +188,26 @@ class _WatchArea(QWidget):
             self.layout_rows_changed.emit(rows)
 
     def _cell_rect(self, idx: int) -> QRectF:
+        slots, _rows = self._layout()
+        if idx < 0 or idx >= len(slots):
+            return QRectF()
         cols = self._column_count()
         cell_w = self.width() / cols
-        row, col = divmod(idx, cols)
+        row, col, _ = slots[idx]
         return QRectF(col * cell_w, row * self._row_height, cell_w, self._row_height)
 
     def _index_at(self, pos) -> int:
         if pos.x() < 0 or pos.y() < 0 or pos.x() >= self.width():
             return -1
+        slots, _rows = self._layout()
         cols = self._column_count()
         cell_w = self.width() / cols
         col = min(cols - 1, int(pos.x() // cell_w))
         row = int(pos.y() // self._row_height)
-        idx = row * cols + col
-        return idx if 0 <= idx < len(self._data.tracks) else -1
+        for i, (r, c, _) in enumerate(slots):
+            if r == row and c == col:
+                return i
+        return -1
 
     def resizeEvent(self, ev) -> None:  # noqa: N802
         super().resizeEvent(ev)
@@ -194,6 +239,23 @@ class _WatchArea(QWidget):
         p.fillRect(self.rect(), _BG)
         p.setFont(self._font)
         data = self._data
+
+        # 组标题（_layout 里填好的）——先画，变量格覆在其下方各行
+        self._layout()
+        if self._headers:
+            gf = QFont(self._font)
+            gf.setBold(True)
+            p.setFont(gf)
+            for row, name in self._headers:
+                r = QRectF(0, row * self._row_height, self.width(), self._row_height)
+                p.fillRect(r, _HEADER_BG)
+                p.setPen(QPen(_GROUP))
+                p.drawText(
+                    r.adjusted(_MARGIN, 0, -_MARGIN, 0),
+                    Qt.AlignmentFlag.AlignVCenter | Qt.AlignmentFlag.AlignLeft,
+                    name,
+                )
+            p.setFont(self._font)
 
         metrics = QFontMetrics(self._font)
         for idx, t in enumerate(data.tracks):
@@ -358,8 +420,9 @@ class WatchPanel(QWidget):
         return not self._area._data.empty
 
     # ---- 对外 API ----
-    def set_run(self, frames: list[FrameResult]) -> None:
-        data = aggregate_watches(frames, self._max_tracks)
+    def set_run(self, frames: list[FrameResult],
+                groups: dict[str, str] | None = None) -> None:
+        data = aggregate_watches(frames, self._max_tracks, groups)
         if data.empty:
             self.clear()
             return

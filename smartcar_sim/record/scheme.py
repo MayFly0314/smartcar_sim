@@ -11,7 +11,7 @@ from __future__ import annotations
 
 import json
 import struct
-from dataclasses import asdict, dataclass, field
+from dataclasses import asdict, dataclass, field, fields
 
 import numpy as np
 
@@ -43,6 +43,7 @@ class ParamField:
     name: str            # 显示名（回放面板里可改，不影响布局）
     ctype: str           # CTYPES key
     expr: str            # 车端 C 变量/表达式（生成代码用）
+    group: str = ""      # 分组名（仅影响面板显示与设计器排序，不影响字节布局）
 
 
 @dataclass
@@ -92,13 +93,30 @@ class RecordScheme:
     def stride(self) -> int:
         return self.sectors_per_frame() * _SECTOR
 
+    def padding_bytes(self) -> int:
+        """每帧补零的余量。参数加到吃光余量就会多占一个扇区、写卡变慢。"""
+        return self.stride() - self.payload_bytes()
+
+    def headroom_hint(self) -> str:
+        """余量提示：还能再加多少参数才会跨扇区。"""
+        pad = self.padding_bytes()
+        if pad == 0:
+            return "⚠ 余量 0B —— 再加任何参数都会多占一个扇区"
+        nxt = self.sectors_per_frame() + 1
+        pct = round(100 / self.sectors_per_frame())
+        return (
+            f"余量 {pad}B（约 {pad // 4} 个 int32/float 参数）"
+            f"——超出后每帧变 {nxt} 扇区，写卡量 +{pct}%"
+        )
+
     def layout_summary(self) -> str:
         m, pb, lb, ib = (
             len(self.magic()), self.params_bytes(), self.line_bytes(), self.image_bytes()
         )
         return (
             f"帧头 {m}B + 参数 {pb}B + 三线 {lb}B + 图像 {ib}B = {self.payload_bytes()}B "
-            f"→ 每帧 {self.sectors_per_frame()} 扇区（{self.stride()}B，含补零）"
+            f"→ 每帧 {self.sectors_per_frame()} 扇区（{self.stride()}B，含补零）\n"
+            f"{self.headroom_hint()}"
         )
 
     # ---- 持久化 ----
@@ -108,12 +126,22 @@ class RecordScheme:
     @classmethod
     def from_json(cls, text: str) -> "RecordScheme":
         d = json.loads(text)
-        d["params"] = [ParamField(**p) for p in d.get("params", [])]
+        # 只取认识的键：老方案没有 group（取默认值），将来多出的键也不会炸
+        d["params"] = [
+            ParamField(**{k: v for k, v in p.items()
+                          if k in ("name", "ctype", "expr", "group")})
+            for p in d.get("params", [])
+        ]
         if "line_fields" in d:
-            d["line_fields"] = [LineField(**p) for p in d.get("line_fields", [])]
+            d["line_fields"] = [
+                LineField(**{k: v for k, v in p.items()
+                             if k in ("name", "ctype", "expr")})
+                for p in d.get("line_fields", [])
+            ]
         else:
             d["line_fields"] = default_line_fields(int(d.get("img_h", 70)))
-        return cls(**d)
+        known = {f.name for f in fields(cls)}
+        return cls(**{k: v for k, v in d.items() if k in known})
 
     # ---- 解码 ----
     def find_frame0_offset(self, data: np.ndarray, search: int = 1 << 16) -> int | None:
@@ -198,21 +226,41 @@ class RecordScheme:
         a = lines.append
         a("/* ================================================================")
         a(" * 由上位机「数据记录方案」自动生成 —— 整段粘贴到 image_record.c 末尾")
-        a(f" * 布局: {self.layout_summary()}")
+        for i, ln in enumerate(self.layout_summary().splitlines()):
+            a(f" * 布局: {ln}" if i == 0 else f" *       {ln}")
         a(" * 依赖同文件已有的 IMG_START_SECTOR / MAX_RECORD_FRAMES / record_idx，")
         a(" * 与原始版 sd_record_frame 共用帧计数与起始扇区——一次只用其中一种，")
         a(" * 回放时在上位机选同一方案打开。")
         a(" * ================================================================ */")
         a(f"#define REC_C_SECTORS   {sec}u")
-        a(f"static uint8 rec_c_buf[REC_C_SECTORS * 512];")
+        a(f"#define REC_IMG_W       {self.img_w}   /* 方案里填的分辨率，非工程宏 */")
+        a(f"#define REC_IMG_H       {self.img_h}")
+        a("/* 缓冲区按方案算，循环也必须按方案走——两者同源才不会写越界。")
+        a(" * 若与工程的 IMG_W/IMG_H 不一致，下面这行编译期就会报错（而不是到车上踩内存）。")
+        a(" * 如果你的工程没有 IMG_W/IMG_H 宏，删掉这一行即可。 */")
+        a("_Static_assert(IMG_W == REC_IMG_W && IMG_H == REC_IMG_H,")
+        a('               "scheme resolution != project IMG_W/IMG_H");')
+        a("static uint8 rec_c_buf[REC_C_SECTORS * 512];")
+        a("")
+        a("/* 多段录制的挂钩：定义了 sd_log_* 那套就用它的基址和帧序号，")
+        a(" * 没定义就退回原来的固定起点行为。这样这段生成代码在两种工程里都能直接编译。 */")
+        a("#ifndef SDLOG_BASE")
+        a("  #ifdef SDLOG_HIST_START            /* 有多段录制模块 */")
+        a("    #define SDLOG_BASE     sdlog_base_lba")
+        a("    #define SDLOG_SEQ_INC  (sdlog_seq++)")
+        a("  #else                              /* 没有：老的固定起点 */")
+        a("    #define SDLOG_BASE     IMG_START_SECTOR")
+        a("    #define SDLOG_SEQ_INC  ((void)0)")
+        a("  #endif")
+        a("#endif")
         a("")
         if self.image_mode == "packed1":
             a("/* 二值图压缩：8 像素/字节，MSB 在前，逐行扫描（上位机按同序解压） */")
-            a("static void rec_pack_1bpp(const uint8 img[IMG_H][IMG_W], uint8 *dst)")
+            a("static void rec_pack_1bpp(uint8 img[REC_IMG_H][REC_IMG_W], uint8 *dst)")
             a("{")
             a("    int x, y; uint32 di = 0; uint8 acc = 0, nb = 0;")
-            a("    for (y = 0; y < IMG_H; y++)")
-            a("        for (x = 0; x < IMG_W; x++) {")
+            a("    for (y = 0; y < REC_IMG_H; y++)")
+            a("        for (x = 0; x < REC_IMG_W; x++) {")
             a("            acc = (uint8)((acc << 1) | (img[y][x] ? 1u : 0u));")
             a("            if (++nb == 8) { dst[di++] = acc; nb = 0; acc = 0; }")
             a("        }")
@@ -223,19 +271,29 @@ class RecordScheme:
         a(f"uint8 {self.func_name}(void)")
         a("{")
         a("    uint8 *p = rec_c_buf;")
+        a("#ifdef SDLOG_HIST_END      /* 多段录制：满 = 写到历史区尽头 */")
+        a("    if (SDLOG_BASE + (record_idx + 1) * REC_C_SECTORS > SDLOG_HIST_END) return 1;")
+        a("#else")
         a("    if (record_idx >= MAX_RECORD_FRAMES) return 1;")
+        a("#endif")
         a("    memset(rec_c_buf, 0, sizeof(rec_c_buf));")
         if magic:
             hexs = " ".join(f"*p++ = 0x{b:02X};" for b in magic)
             a(f"    {hexs}                     /* 帧头 */")
+        cur_group = None
         for p in self.params:
             _fmt, size, _np, cname = CTYPES[p.ctype]
+            g = (p.group or "").strip()
+            if g != cur_group:
+                cur_group = g
+                if g:
+                    a(f"    /* ---- {g} ---- */")
             a(f"    {{ {cname} v = ({cname})({p.expr}); "
               f"memcpy(p, &v, {size}); p += {size}; }}  /* {p.name} */")
         for line in self.line_fields:
             _fmt, size, _np, cname = CTYPES[line.ctype]
             a(f"    /* {line.name}: 每行一个 x 坐标，负数表示无效 */")
-            a(f"    for (uint32 i = 0; i < IMG_H; ++i) {{ {cname} v = ({cname})({line.expr}[i]); "
+            a(f"    for (int i = 0; i < REC_IMG_H; ++i) {{ {cname} v = ({cname})({line.expr}[i]); "
               f"memcpy(p, &v, {size}); p += {size}; }}")
         if self.image_mode == "packed1":
             a(f"    rec_pack_1bpp({self.image_expr}, p);            "
@@ -243,10 +301,14 @@ class RecordScheme:
         elif self.image_mode == "raw8":
             a(f"    memcpy(p, {self.image_expr}, {self.image_bytes()}u);  "
               f"/* 图像原始 {self.image_bytes()}B */")
+        # 多段录制：基址、帧序号、满判据都由生成器写出来，
+        # 免得用户重新粘贴时把手工加的那几行覆盖掉（踩过一次：
+        # sdlog_seq++ 被覆盖 → seq 恒为 0 → 上位机每段只认出 1 帧）。
         a("    if (SD_write_sector_data(rec_c_buf,")
-        a("            IMG_START_SECTOR + record_idx * REC_C_SECTORS,")
+        a("            SDLOG_BASE + record_idx * REC_C_SECTORS,")
         a("            REC_C_SECTORS)) return 2;")
         a("    record_idx++;")
+        a("    SDLOG_SEQ_INC;")
         a("    return 0;")
         a("}")
         return "\n".join(lines) + "\n"
