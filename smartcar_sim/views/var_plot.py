@@ -94,6 +94,7 @@ class _Curve(QWidget):
 
     frame_selected = Signal(int)
     y_range_requested = Signal(float, float)   # Ctrl+滚轮/右键竖直拖拽请求的新量程 (lo, hi)
+    x_view_changed = Signal()                  # 用户手动缩放/平移了横向视野（程序化设置不发）
 
     def __init__(self, parent=None):
         super().__init__(parent)
@@ -309,6 +310,20 @@ class _Curve(QWidget):
         if r.left() <= pos.x() <= r.right():
             self.frame_selected.emit(self._frame_at_x(pos.x(), r))
 
+    def x_view(self) -> tuple[float, float]:
+        """当前可见帧窗口（公开只读，实时面板做可见区适配用）。"""
+        return self._x_view()
+
+    def show_last(self, count: int) -> None:
+        """滚动跟随：视野定到最近 count 个点（实时波形用，不触发 x_view_changed）。"""
+        n = self.frame_count()
+        if n <= 1 or count >= n - 1:
+            self._x_full = True
+        else:
+            self._x0, self._x1 = float(n - 1 - count), float(n - 1)
+            self._x_full = False
+        self.update()
+
     def reset_x_view(self) -> None:
         self._x_full = True
         self.update()
@@ -323,12 +338,14 @@ class _Curve(QWidget):
         span = min(max((x1 - x0) * factor, min(10.0, full)), full)
         if span >= full:
             self.reset_x_view()
+            self.x_view_changed.emit()
             return
         ratio = (anchor - x0) / (x1 - x0)    # 锚点在窗口内的相对位置保持不变
         nx0 = max(0.0, min(anchor - span * ratio, full - span))
         self._x0, self._x1 = nx0, nx0 + span
         self._x_full = False
         self.update()
+        self.x_view_changed.emit()
 
     def _pan_x(self, dframes: float) -> None:
         n = self.frame_count()
@@ -340,6 +357,7 @@ class _Curve(QWidget):
         self._x0, self._x1 = nx0, nx0 + span
         self._x_full = False
         self.update()
+        self.x_view_changed.emit()
 
     def _pan_y(self, dpx: float) -> None:
         """按像素位移竖直平移。量程归工具条管，这里只发信号。"""

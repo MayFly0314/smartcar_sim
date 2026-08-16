@@ -8,6 +8,7 @@ from smartcar_sim.link.serial_link import (
     CustomRawProtocol,
     SeekfreeAssistantProtocol,
     ShanwaiProtocol,
+    WaveProtocol,
     make_protocol,
     parse_hex,
 )
@@ -191,6 +192,7 @@ def test_make_protocol_keys():
     assert isinstance(make_protocol("shanwai"), ShanwaiProtocol)
     assert isinstance(make_protocol("seekfree"), SeekfreeAssistantProtocol)
     assert isinstance(make_protocol("custom", "55 AA"), CustomRawProtocol)
+    assert isinstance(make_protocol("wave"), WaveProtocol)
     assert isinstance(make_protocol("unknown"), ShanwaiProtocol)  # 兜底
 
 
@@ -201,3 +203,57 @@ def test_parse_hex():
     assert parse_hex("") == b""
     with pytest.raises(ValueError):
         parse_hex("ABC")  # 奇数位
+
+
+# ---- 协议 D：变量波形 ----
+
+def _wave_frame(vals: list[float]) -> bytes:
+    payload = np.asarray(vals, dtype="<f4").tobytes()
+    n = len(vals)
+    return b"\xaa\xff" + bytes([n]) + payload + bytes([(n + sum(payload)) & 0xFF])
+
+
+def test_wave_single_frame():
+    buf = bytearray(_wave_frame([1.5, -2.0]))
+    out = list(WaveProtocol().feed(buf, 0, 0))
+    assert len(out) == 1
+    np.testing.assert_allclose(out[0], [1.5, -2.0])
+    assert len(buf) == 0
+
+
+def test_wave_partial_reads_accumulate():
+    stream = _wave_frame([3.25])
+    proto = WaveProtocol()
+    buf = bytearray()
+    out = []
+    for i in range(0, len(stream), 2):
+        buf += stream[i : i + 2]
+        out += list(proto.feed(buf, 0, 0))
+    assert len(out) == 1
+    np.testing.assert_allclose(out[0], [3.25])
+
+
+def test_wave_back_to_back_mixed_counts():
+    buf = bytearray(_wave_frame([1.0]) + _wave_frame([2.0, 3.0]) + _wave_frame([4.0, 5.0, 6.0]))
+    out = list(WaveProtocol().feed(buf, 0, 0))
+    assert [len(o) for o in out] == [1, 2, 3]
+    np.testing.assert_allclose(out[1], [2.0, 3.0])
+
+
+def test_wave_bad_checksum_resyncs():
+    """坏校验帧被丢掉，后面的好帧照常解析（float 里出现 AA FF 也不会交伪帧）。"""
+    good = _wave_frame([7.0, 8.0])
+    bad = bytearray(good)
+    bad[-1] ^= 0xFF
+    buf = bytearray(bytes(bad) + good)
+    out = list(WaveProtocol().feed(buf, 0, 0))
+    assert len(out) == 1
+    np.testing.assert_allclose(out[0], [7.0, 8.0])
+
+
+def test_wave_garbage_prefix_and_invalid_count():
+    # 垃圾前缀 + 一个 cnt=0 的伪帧头，都要能跳过
+    buf = bytearray(b"\x00\xaa\xff\x00\x12" + _wave_frame([9.0]))
+    out = list(WaveProtocol().feed(buf, 0, 0))
+    assert len(out) == 1
+    np.testing.assert_allclose(out[0], [9.0])

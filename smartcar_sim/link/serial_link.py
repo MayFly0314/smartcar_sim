@@ -6,6 +6,7 @@
   协议 A 山外/逐飞早期库(seekfree_sendimg_03x)：帧头 00 FF 01 01 + uint8[W*H] 逐行灰度
   协议 B 逐飞助手：AA 02 <camera_type> 08 <W_LE16> <H_LE16> + 像素（自描述宽高/像素格式）
   协议 C 自定义：帧头(可空)与 W×H 全部可配
+  协议 D 变量波形（调参遥测）：AA FF + 通道数 + n×float32(LE) + 校验和，产出一维数组
 
 设计要点：
 - feed(buf, w, h) 是消费型生成器——把 buf(bytearray) 里所有已完整的帧 yield 出来，
@@ -239,11 +240,63 @@ class SeekfreeAssistantProtocol(FrameProtocol):
                     yield frame
 
 
+class WaveProtocol(FrameProtocol):
+    """协议 D：变量波形（调 PI 等参数用的遥测通道）。
+
+    帧格式：AA FF │ cnt(uint8, 1~16) │ cnt × float32(LE) │ sum8
+    sum8 = (cnt + 所有数据字节) & 0xFF。校验不过丢 1 字节重扫——float 数据里
+    天然可能出现 AA FF，靠校验和排除伪帧头。
+
+    车端测试函数参考（逐飞库风格）：
+        void send_wave(float *v, uint8 n) {
+            uint8 head[3] = {0xAA, 0xFF, n}, sum = n, *p = (uint8 *)v;
+            for (uint16 i = 0; i < 4u * n; i++) sum += p[i];
+            uart_putbuff(UART_x, head, 3);
+            uart_putbuff(UART_x, p, 4u * n);
+            uart_putchar(UART_x, sum);
+        }
+        // 调速度环：float d[2] = {target, speed}; send_wave(d, 2);
+
+    feed 产出 shape=(cnt,) 的 float32 数组；上位机按通道画实时曲线。
+    """
+
+    name = "wave"
+    needs_size = False   # 与宽高无关
+    _HDR = b"\xaa\xff"
+    _MAX_CH = 16
+
+    def feed(self, buf: bytearray, w: int, h: int):
+        while True:
+            idx = buf.find(self._HDR)
+            if idx < 0:
+                if len(buf) > 1:  # 只保留末尾可能的半个帧头
+                    del buf[: len(buf) - 1]
+                return
+            if idx:
+                del buf[:idx]
+            if len(buf) < 3:
+                return
+            cnt = buf[2]
+            if not 1 <= cnt <= self._MAX_CH:
+                del buf[:1]
+                continue
+            need = 3 + 4 * cnt + 1
+            if len(buf) < need:
+                return
+            payload = bytes(buf[3 : 3 + 4 * cnt])
+            if buf[need - 1] != (cnt + sum(payload)) & 0xFF:
+                del buf[:1]
+                continue
+            del buf[:need]
+            yield np.frombuffer(payload, dtype="<f4").copy()
+
+
 # UI 下拉用：(key, 显示名, 是否需要 UI 给宽高)
 PROTOCOL_CHOICES: list[tuple[str, str, bool]] = [
     ("shanwai", "山外/逐飞 4字节头 (00 FF 01 01)", True),
     ("seekfree", "逐飞助手 (0xAA 自描述)", False),
     ("custom", "自定义 raw (可配帧头)", True),
+    ("wave", "变量波形示波器 (AA FF float32)", False),
 ]
 
 
@@ -252,6 +305,8 @@ def make_protocol(key: str, header_hex: str = "", footer_hex: str = "") -> Frame
         return SeekfreeAssistantProtocol()
     if key == "custom":
         return CustomRawProtocol(parse_hex(header_hex), parse_hex(footer_hex))
+    if key == "wave":
+        return WaveProtocol()
     return ShanwaiProtocol()
 
 

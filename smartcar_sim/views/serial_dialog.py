@@ -2,6 +2,7 @@
 
 职责：选端口/波特率/协议 → 后台线程实时收帧 → 预览；"抓取 N 帧"攒成 FrameSet
 经信号交给主窗口走现成运行流水线；可选"逐帧在线跑算法叠加"。
+选「变量波形示波器」协议时，预览区换成实时曲线面板（调 PI 用，见 live_plot.py）。
 """
 from __future__ import annotations
 
@@ -34,6 +35,7 @@ from ..link.serial_link import (
 )
 from ..settings import Settings
 from .image_view import gray_to_qimage
+from .live_plot import LiveWavePanel
 
 _BAUDS = ["115200", "230400", "460800", "921600", "1500000", "2000000"]
 
@@ -138,12 +140,16 @@ class SerialDialog(QDialog):
         grid.addWidget(self._btn_conn, r, 0, 1, 3)
         root.addWidget(gb_conn)
 
-        # 预览区
+        # 预览区（图像协议）/ 实时波形区（变量波形协议），按协议二选一显示
         self._preview = QLabel("未连接")
         self._preview.setAlignment(Qt.AlignmentFlag.AlignCenter)
         self._preview.setMinimumHeight(260)
         self._preview.setStyleSheet("background:#1e1e1e; color:#888; border:1px solid #333;")
         root.addWidget(self._preview, 1)
+
+        self._wave = LiveWavePanel()
+        self._wave.hide()
+        root.addWidget(self._wave, 1)
 
         self._lbl_status = QLabel("未连接")
         self._lbl_status.setStyleSheet("color:#9cdcfe; font-family:Consolas;")
@@ -203,8 +209,20 @@ class SerialDialog(QDialog):
         self._spin_h.setEnabled(needs_size)
         self._edit_header.setEnabled(key == "custom")
         self._edit_footer.setEnabled(key == "custom")
+        # 变量波形协议：图像预览换成实时曲线，抓取/在线仿真无意义
+        is_wave = key == "wave"
+        self._preview.setVisible(not is_wave)
+        self._wave.setVisible(is_wave)
+        self._btn_capture.setEnabled(not is_wave)
+        self._chk_online.setEnabled(not is_wave)
+        self._update_bw_hint()
 
     def _update_bw_hint(self) -> None:
+        if self._combo_proto.currentData() == "wave":
+            self._lbl_bw.setText(
+                "帧格式：AA FF｜通道数 n｜n×float32(LE)｜校验 = (n+数据字节和)&0xFF"
+            )
+            return
         try:
             baud = int(self._combo_baud.currentText())
         except ValueError:
@@ -273,6 +291,7 @@ class SerialDialog(QDialog):
         self._port_label = port
         self._total = 0
         self._fps_count = 0
+        self._wave.clear()                    # 新一轮调参从干净的图开始
         self._set_config_enabled(False)
         self._btn_conn.setText("断开")
         self._lbl_status.setText(f"连接中… {port} @ {baud}")
@@ -311,6 +330,9 @@ class SerialDialog(QDialog):
     def _on_frame(self, frame) -> None:
         self._total += 1
         self._fps_count += 1
+        if getattr(frame, "ndim", 2) == 1:   # 波形帧（协议 D）→ 实时曲线
+            self._wave.append(frame)
+            return
         self._update_preview(frame)
         if self._online:
             self.frame_online.emit(frame)
