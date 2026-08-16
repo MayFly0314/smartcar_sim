@@ -168,6 +168,23 @@ class Settings:
     def record_scheme(self, v: str) -> None:
         self._s.setValue("record_scheme", v)
 
+    # ---- 变量曲线窗口 ----
+    @property
+    def var_plot_w(self) -> int:
+        return int(self._s.value("var_plot_w", 940))
+
+    @var_plot_w.setter
+    def var_plot_w(self, v: int) -> None:
+        self._s.setValue("var_plot_w", int(v))
+
+    @property
+    def var_plot_h(self) -> int:
+        return int(self._s.value("var_plot_h", 430))
+
+    @var_plot_h.setter
+    def var_plot_h(self, v: int) -> None:
+        self._s.setValue("var_plot_h", int(v))
+
     # ---- 界面壁纸 ----
     @property
     def wallpaper_path(self) -> str:

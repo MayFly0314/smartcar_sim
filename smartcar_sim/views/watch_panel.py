@@ -409,6 +409,10 @@ class WatchPanel(QWidget):
                 self.var_activated.emit(name, list(t.values))
                 return
 
+    def names(self) -> list[str]:
+        """本面板当前有哪些变量（曲线窗口据此列出可叠加的其他变量）。"""
+        return [t.name for t in self._area._data.tracks]
+
     def values_of(self, name: str) -> list | None:
         """取某变量的跨帧序列（曲线窗口刷新用）。"""
         for t in self._area._data.tracks:

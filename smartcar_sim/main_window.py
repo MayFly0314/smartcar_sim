@@ -573,12 +573,28 @@ void image_process(uint8_t img[IMG_H][IMG_W])
             "timeout": self.settings.timeout_base,
         })
 
-    # ---- 单变量曲线窗口 ----
+    # ---- 变量曲线窗口 ----
+    def _var_catalog(self) -> dict[str, list]:
+        """当前可画的所有变量：sim_plot 监视 + 车端记录。
+
+        曲线窗口用它列出「可叠加的其他变量」，也用它在重跑后刷新每条线。
+        """
+        out: dict[str, list] = {}
+        for panel in (self.watch_panel, self.rec_panel):
+            try:
+                for name in panel.names():
+                    vals = panel.values_of(name)
+                    if vals is not None:
+                        out.setdefault(name, list(vals))
+            except Exception:  # noqa: BLE001
+                continue
+        return out
+
     def _open_var_plot(self, name: str, values) -> None:
-        """双击监视/车端记录里的变量 -> 独立曲线窗口（同名复用，多变量可并开）。"""
+        """双击监视/车端记录里的变量 -> 曲线窗口（同名复用，可再叠加其他变量）。"""
         dlg = self._var_plots.get(name)
         if dlg is None:
-            dlg = VarPlotDialog(name, list(values), self)
+            dlg = VarPlotDialog(name, list(values), self, provider=self._var_catalog)
             dlg.frame_selected.connect(self.timeline.goto)
             dlg.finished.connect(lambda _=0, n=name: self._var_plots.pop(n, None))
             self._var_plots[name] = dlg
@@ -590,13 +606,10 @@ void image_process(uint8_t img[IMG_H][IMG_W])
         dlg.activateWindow()
 
     def _refresh_var_plots(self) -> None:
-        """重跑/换数据后刷新已打开的曲线窗口；变量消失的窗口留着不动。"""
-        for name, dlg in list(self._var_plots.items()):
-            vals = self.watch_panel.values_of(name)
-            if vals is None:
-                vals = self.rec_panel.values_of(name)
-            if vals is not None:
-                dlg.set_values(vals)
+        """重跑/换数据后刷新已打开的曲线窗口（每条线都刷，不只主变量）。"""
+        catalog = self._var_catalog()
+        for _name, dlg in list(self._var_plots.items()):
+            dlg.set_all_values(catalog)
             dlg.set_current_frame(self.timeline.current())
 
     # ---- SD 卡直读 ----
