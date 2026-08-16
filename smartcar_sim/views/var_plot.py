@@ -12,6 +12,7 @@
 """
 from __future__ import annotations
 
+import json
 import math
 from dataclasses import dataclass, field
 
@@ -19,12 +20,14 @@ from PySide6.QtCore import QPointF, QRectF, Qt, Signal
 from PySide6.QtGui import QColor, QFont, QPainter, QPen
 from PySide6.QtWidgets import (
     QCheckBox,
-    QComboBox,
     QDialog,
+    QDialogButtonBox,
     QDoubleSpinBox,
     QFrame,
     QHBoxLayout,
     QLabel,
+    QListWidget,
+    QListWidgetItem,
     QPushButton,
     QScrollArea,
     QToolTip,
@@ -457,6 +460,47 @@ class _LegendRow(QWidget):
         self._chk.blockSignals(False)
 
 
+class _AddVarsDialog(QDialog):
+    """一次勾选多个变量叠加进图。"""
+
+    def __init__(self, names: list[str], parent=None):
+        super().__init__(parent)
+        self.setWindowTitle("叠加变量")
+        self._list = QListWidget()
+        for n in names:
+            it = QListWidgetItem(n)
+            it.setFlags(it.flags() | Qt.ItemFlag.ItemIsUserCheckable)
+            it.setCheckState(Qt.CheckState.Unchecked)
+            self._list.addItem(it)
+        b_all = QPushButton("全选")
+        b_none = QPushButton("清空")
+        b_all.clicked.connect(lambda: self._set_all(Qt.CheckState.Checked))
+        b_none.clicked.connect(lambda: self._set_all(Qt.CheckState.Unchecked))
+        bb = QDialogButtonBox(QDialogButtonBox.StandardButton.Ok
+                              | QDialogButtonBox.StandardButton.Cancel)
+        bb.accepted.connect(self.accept)
+        bb.rejected.connect(self.reject)
+        row = QHBoxLayout()
+        row.addWidget(b_all)
+        row.addWidget(b_none)
+        row.addStretch(1)
+        lay = QVBoxLayout(self)
+        lay.addWidget(QLabel("勾选要叠加到图上的变量："))
+        lay.addWidget(self._list, 1)
+        lay.addLayout(row)
+        lay.addWidget(bb)
+        self.resize(260, 360)
+
+    def _set_all(self, state: Qt.CheckState) -> None:
+        for i in range(self._list.count()):
+            self._list.item(i).setCheckState(state)
+
+    def checked_names(self) -> list[str]:
+        return [self._list.item(i).text()
+                for i in range(self._list.count())
+                if self._list.item(i).checkState() == Qt.CheckState.Checked]
+
+
 class VarPlotDialog(QDialog):
     """多变量曲线窗口（非模态，可同时开多个）。"""
 
@@ -551,15 +595,10 @@ class VarPlotDialog(QDialog):
         # ---- 右侧：变量选择（图例 + 开关）----
         side = QVBoxLayout()
         side.setSpacing(4)
-        row_add = QHBoxLayout()
-        self._combo_add = QComboBox()
-        self._combo_add.setMinimumWidth(150)
-        self._combo_add.setToolTip("选一个变量叠加到同一张图上")
-        btn_add = QPushButton("+ 叠加")
-        btn_add.clicked.connect(self._add_from_combo)
-        row_add.addWidget(self._combo_add, 1)
-        row_add.addWidget(btn_add)
-        side.addLayout(row_add)
+        self._btn_add = QPushButton("+ 叠加变量…")
+        self._btn_add.setToolTip("一次勾选多个变量，叠加到同一张图上")
+        self._btn_add.clicked.connect(self._open_add_dialog)
+        side.addWidget(self._btn_add)
 
         row_sel = QHBoxLayout()
         b_all = QPushButton("全选")
@@ -609,7 +648,8 @@ class VarPlotDialog(QDialog):
         self._curve.y_range_requested.connect(self._on_y_range_requested)
 
         self._add_series(name, list(values))
-        self._refresh_combo()
+        self._restore_overlays()
+        self._refresh_add_btn()
         self._rebuild_rows()
         self._after_data_change()
 
@@ -622,35 +662,93 @@ class VarPlotDialog(QDialog):
     def names(self) -> list[str]:
         return [s.name for s in self._series]
 
-    def _refresh_combo(self) -> None:
-        self._combo_add.clear()
+    def available_names(self) -> list[str]:
+        """还能叠加的变量（provider 目录里去掉已在图上的）。"""
         if self._provider is None:
-            self._combo_add.setEnabled(False)
-            self._combo_add.addItem("（无其他变量）")
-            return
+            return []
         try:
             catalog = self._provider() or {}
         except Exception:  # noqa: BLE001
-            catalog = {}
+            return []
         have = set(self.names())
-        rest = [n for n in catalog if n not in have]
-        self._combo_add.setEnabled(bool(rest))
-        self._combo_add.addItems(rest or ["（没有可叠加的变量了）"])
+        return [n for n in catalog if n not in have]
 
-    def _add_from_combo(self) -> None:
-        if self._provider is None or not self._combo_add.isEnabled():
+    def _refresh_add_btn(self) -> None:
+        if self._provider is None:
+            self._btn_add.setEnabled(False)
+            self._btn_add.setText("（无其他变量）")
             return
-        name = self._combo_add.currentText()
+        avail = self.available_names()
+        self._btn_add.setEnabled(bool(avail))
+        self._btn_add.setText("+ 叠加变量…" if avail else "（没有可叠加的变量了）")
+
+    def _open_add_dialog(self) -> None:
+        avail = self.available_names()
+        if not avail:
+            return
+        dlg = _AddVarsDialog(avail, self)
+        if dlg.exec() != QDialog.DialogCode.Accepted:
+            return
+        self.add_series_by_names(dlg.checked_names())
+
+    def add_series_by_names(self, names: list[str]) -> None:
+        """按名字批量叠加；目录里没有的、已在图上的跳过。"""
+        if self._provider is None or not names:
+            return
         try:
             catalog = self._provider() or {}
         except Exception:  # noqa: BLE001
             return
-        if name not in catalog:
+        have = set(self.names())
+        added = False
+        for n in names:
+            if n in have or n not in catalog:
+                continue
+            self._add_series(n, list(catalog[n]))
+            have.add(n)
+            added = True
+        if not added:
             return
-        self._add_series(name, list(catalog[name]))
-        self._refresh_combo()
+        self._refresh_add_btn()
         self._rebuild_rows()
         self._after_data_change()
+        self._save_overlays()
+
+    # ---- 叠加选择记忆（换 SD 数据/重开窗口后不用重新一个个加）----
+    def _save_overlays(self) -> None:
+        try:
+            data = json.loads(self._settings.var_plot_overlays or "{}")
+        except ValueError:
+            data = {}
+        data[self._name] = [[s.name, s.visible] for s in self._series]
+        self._settings.var_plot_overlays = json.dumps(data, ensure_ascii=False)
+
+    def _restore_overlays(self) -> None:
+        """按上次的选择把叠加变量加回来；当前数据里没有的跳过（不改动记忆本身）。"""
+        if self._provider is None:
+            return
+        try:
+            saved = json.loads(self._settings.var_plot_overlays or "{}").get(self._name)
+        except ValueError:
+            return
+        if not saved:
+            return
+        try:
+            catalog = self._provider() or {}
+        except Exception:  # noqa: BLE001
+            return
+        vis: dict[str, bool] = {}
+        for entry in saved:
+            try:
+                vis[str(entry[0])] = bool(entry[1])
+            except (TypeError, IndexError):
+                continue
+        for n, on in vis.items():
+            if n != self._name and n in catalog and n not in self._slot:
+                self._add_series(n, list(catalog[n]))
+        for s in self._series:
+            if s.name != self._name and s.name in vis:   # 主变量刚点开必须可见
+                s.visible = vis[s.name]
 
     def _rebuild_rows(self) -> None:
         while self._rows_box.count() > 1:            # 保留末尾 stretch
@@ -674,6 +772,7 @@ class VarPlotDialog(QDialog):
             if s.name == name:
                 s.visible = on
         self._after_data_change()
+        self._save_overlays()
 
     def _on_solo(self, name: str) -> None:
         for s in self._series:
@@ -681,6 +780,7 @@ class VarPlotDialog(QDialog):
         for n, row in self._rows.items():
             row.set_checked(n == name)
         self._after_data_change()
+        self._save_overlays()
 
     def _set_all(self, on: bool) -> None:
         for s in self._series:
@@ -688,15 +788,17 @@ class VarPlotDialog(QDialog):
         for row in self._rows.values():
             row.set_checked(on)
         self._after_data_change()
+        self._save_overlays()
 
     def _drop_unchecked(self) -> None:
         keep = [s for s in self._series if s.visible]
         if not keep:                                  # 别把图清空
             return
         self._series = keep
-        self._refresh_combo()
+        self._refresh_add_btn()
         self._rebuild_rows()
         self._after_data_change()
+        self._save_overlays()
 
     # ---- 数据 ----
     def set_values(self, values: list[float | None]) -> None:
@@ -709,7 +811,7 @@ class VarPlotDialog(QDialog):
             vals = catalog.get(s.name)
             if vals is not None:
                 s.values = list(vals)
-        self._refresh_combo()
+        self._refresh_add_btn()
         self._after_data_change()
 
     def _after_data_change(self) -> None:

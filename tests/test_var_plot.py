@@ -12,12 +12,47 @@ pytest.importorskip("PySide6")
 from PySide6.QtGui import QImage  # noqa: E402
 from PySide6.QtWidgets import QApplication  # noqa: E402
 
+import smartcar_sim.views.var_plot as var_plot_mod  # noqa: E402
 from smartcar_sim.views.var_plot import VarPlotDialog, color_for  # noqa: E402
 
 
 @pytest.fixture(scope="module")
 def app():
     return QApplication.instance() or QApplication([])
+
+
+@pytest.fixture(autouse=True)
+def fake_settings(monkeypatch):
+    """把 Settings 换成内存字典：测试不碰真实注册表，也互不串味。"""
+    store: dict = {}
+
+    class _Fake:
+        @property
+        def var_plot_w(self):
+            return store.get("w", 940)
+
+        @var_plot_w.setter
+        def var_plot_w(self, v):
+            store["w"] = int(v)
+
+        @property
+        def var_plot_h(self):
+            return store.get("h", 430)
+
+        @var_plot_h.setter
+        def var_plot_h(self, v):
+            store["h"] = int(v)
+
+        @property
+        def var_plot_overlays(self):
+            return store.get("overlays", "")
+
+        @var_plot_overlays.setter
+        def var_plot_overlays(self, v):
+            store["overlays"] = str(v)
+
+    monkeypatch.setattr(var_plot_mod, "Settings", _Fake)
+    return store
 
 
 def _catalog():
@@ -38,27 +73,23 @@ def _dlg(app, first="当前转速"):
 def test_starts_with_single_series(app):
     dlg, cat = _dlg(app)
     assert dlg.names() == ["当前转速"]
-    # 下拉里应该列出其余变量
-    items = [dlg._combo_add.itemText(i) for i in range(dlg._combo_add.count())]
-    assert set(items) == set(cat) - {"当前转速"}
+    # 可叠加清单应该列出其余变量
+    assert set(dlg.available_names()) == set(cat) - {"当前转速"}
 
 
 def test_overlay_additional_series(app):
     dlg, _ = _dlg(app)
-    dlg._combo_add.setCurrentIndex(dlg._combo_add.findText("目标速度"))
-    dlg._add_from_combo()
+    dlg.add_series_by_names(["目标速度"])
     assert dlg.names() == ["当前转速", "目标速度"]
-    # 叠加后下拉里不该再出现已在图上的变量
-    items = [dlg._combo_add.itemText(i) for i in range(dlg._combo_add.count())]
-    assert "目标速度" not in items
+    # 已在图上的变量不该再出现在可叠加清单里
+    assert "目标速度" not in dlg.available_names()
 
 
 def test_colors_are_stable_when_hiding(app):
     """颜色跟变量走，不跟可见序号走——否则隐藏一条会让其余线全换色。"""
     dlg, _ = _dlg(app)
     for name in ("目标速度", "PWM"):
-        dlg._combo_add.setCurrentIndex(dlg._combo_add.findText(name))
-        dlg._add_from_combo()
+        dlg.add_series_by_names([name])
     before = {s.name: s.color.name() for s in dlg._series}
     assert len(set(before.values())) == 3        # 三条线三种颜色
 
@@ -70,8 +101,7 @@ def test_colors_are_stable_when_hiding(app):
 def test_solo_shows_only_one(app):
     dlg, _ = _dlg(app)
     for name in ("目标速度", "PWM"):
-        dlg._combo_add.setCurrentIndex(dlg._combo_add.findText(name))
-        dlg._add_from_combo()
+        dlg.add_series_by_names([name])
     dlg._on_solo("PWM")
     assert [s.name for s in dlg._series if s.visible] == ["PWM"]
     assert {n: r._chk.isChecked() for n, r in dlg._rows.items()} == {
@@ -90,8 +120,7 @@ def test_set_all_and_empty_is_safe(app):
 def test_shared_range_spans_all_visible(app):
     """共享量程要覆盖所有可见曲线，否则叠加没有意义。"""
     dlg, cat = _dlg(app)
-    dlg._combo_add.setCurrentIndex(dlg._combo_add.findText("PWM"))
-    dlg._add_from_combo()
+    dlg.add_series_by_names(["PWM"])
     dlg._fit(silent=True)
     lo, hi = dlg._curve._lo, dlg._curve._hi
     assert lo <= min(cat["PWM"]) and hi >= max(cat["当前转速"])
@@ -100,8 +129,7 @@ def test_shared_range_spans_all_visible(app):
 def test_normalized_each_series_fills_plot(app):
     """归一化：每条线各自铺满绘图区，用来比较量纲不同的量的形状。"""
     dlg, _ = _dlg(app)
-    dlg._combo_add.setCurrentIndex(dlg._combo_add.findText("PWM"))
-    dlg._add_from_combo()
+    dlg.add_series_by_names(["PWM"])
     dlg.resize(800, 400)
     dlg._chk_norm.setChecked(True)
     r = dlg._curve._plot_rect()
@@ -134,8 +162,7 @@ def test_constant_series_does_not_divide_by_zero(app):
 def test_refresh_updates_every_series(app):
     """重跑后所有曲线都要刷新，不能只刷主变量。"""
     dlg, cat = _dlg(app)
-    dlg._combo_add.setCurrentIndex(dlg._combo_add.findText("目标速度"))
-    dlg._add_from_combo()
+    dlg.add_series_by_names(["目标速度"])
     cat2 = {k: [v * 2 for v in vals] for k, vals in cat.items()}
     dlg.set_all_values(cat2)
     for s in dlg._series:
@@ -144,8 +171,7 @@ def test_refresh_updates_every_series(app):
 
 def test_drop_unchecked_keeps_at_least_one(app):
     dlg, _ = _dlg(app)
-    dlg._combo_add.setCurrentIndex(dlg._combo_add.findText("PWM"))
-    dlg._add_from_combo()
+    dlg.add_series_by_names(["PWM"])
     dlg._on_row_toggled("PWM", False)
     dlg._drop_unchecked()
     assert dlg.names() == ["当前转速"]
@@ -244,3 +270,43 @@ def test_zoomed_render_smoke(app):
     img = QImage(max(1, c.width()), max(1, c.height()),
                  QImage.Format.Format_RGB32)
     c.render(img)
+
+
+# ---- 批量叠加 / 选择记忆 ----
+
+def test_bulk_add_multiple_at_once(app):
+    """一次勾选多个变量叠加；重复的、目录里没有的跳过。"""
+    dlg, _ = _dlg(app)
+    dlg.add_series_by_names(["目标速度", "PWM", "当前转速", "不存在的变量"])
+    assert dlg.names() == ["当前转速", "目标速度", "PWM"]
+    assert len({s.color.name() for s in dlg._series}) == 3
+
+
+def test_overlays_persist_across_reopen(app):
+    """换一份 SD 数据/重开窗口后：叠加组合和勾选状态自动恢复。"""
+    cat = _catalog()
+    dlg1 = VarPlotDialog("当前转速", cat["当前转速"], provider=lambda: dict(cat))
+    dlg1.add_series_by_names(["目标速度", "PWM"])
+    dlg1._on_row_toggled("PWM", False)        # 隐藏状态也要记住
+
+    cat2 = {k: [v * 2 for v in vals] for k, vals in cat.items()}   # 换一份数据
+    dlg2 = VarPlotDialog("当前转速", cat2["当前转速"], provider=lambda: dict(cat2))
+    assert dlg2.names() == ["当前转速", "目标速度", "PWM"]
+    vis = {s.name: s.visible for s in dlg2._series}
+    assert vis == {"当前转速": True, "目标速度": True, "PWM": False}
+    assert dlg2._series[2].values == cat2["PWM"]                   # 数据是新的，不是旧的
+
+
+def test_restore_skips_missing_without_forgetting(app):
+    """新数据里缺某个变量：跳过它，但记忆不被抹掉，下次数据齐了还能回来。"""
+    cat = _catalog()
+    dlg1 = VarPlotDialog("当前转速", cat["当前转速"], provider=lambda: dict(cat))
+    dlg1.add_series_by_names(["目标速度", "PWM"])
+
+    cat_no_pwm = {k: v for k, v in cat.items() if k != "PWM"}
+    dlg2 = VarPlotDialog("当前转速", cat_no_pwm["当前转速"],
+                         provider=lambda: dict(cat_no_pwm))
+    assert dlg2.names() == ["当前转速", "目标速度"]
+
+    dlg3 = VarPlotDialog("当前转速", cat["当前转速"], provider=lambda: dict(cat))
+    assert dlg3.names() == ["当前转速", "目标速度", "PWM"]

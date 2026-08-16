@@ -185,6 +185,15 @@ class Settings:
     def var_plot_h(self, v: int) -> None:
         self._s.setValue("var_plot_h", int(v))
 
+    @property
+    def var_plot_overlays(self) -> str:
+        """曲线窗口的叠加选择（JSON：主变量名 -> [[变量名, 是否可见], ...]）。"""
+        return str(self._s.value("var_plot_overlays", "") or "")
+
+    @var_plot_overlays.setter
+    def var_plot_overlays(self, v: str) -> None:
+        self._s.setValue("var_plot_overlays", v)
+
     # ---- 界面壁纸 ----
     @property
     def wallpaper_path(self) -> str:
